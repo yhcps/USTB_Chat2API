@@ -176,7 +176,7 @@ python manage_keys.py revoke <前缀>     # 吊销
 | 回复"抱歉，我无法回答" | 上游内容审核拦截，换个措辞重试即可（服务本身正常） |
 | 模型回复中出现 `<>` 标签 | 已由工具调用桥实时转换。确认服务已升级到最新版并重启；可查看 `server_debug.log` 中该请求的 tools 与转换记录 |
 | 托盘图标黄色 | 会话失效：托盘右键 → 登录/更新 Cookie |
-| 端口 8787 被占用 | 关闭占用进程：`netstat -ano | findstr 8787` 后 `taskkill /PID <pid> /F`，或修改 `chat2api.py` 中 `PORT` |
+| 端口 8787 被占用 | 关闭占用进程：先 `netstat -ano` 找到 8787 对应 PID，再 `taskkill /PID <pid> /F`；或修改 `chat2api.py` 中 `PORT` |
 | Cookie 频繁过期 | 学校 SSO 会话有有效期，失效后重新按 `[4]` 登录即可 |
 
 ### 日志文件
