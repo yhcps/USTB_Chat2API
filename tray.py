@@ -240,7 +240,15 @@ def on_regen_key(icon, _):
     notify(icon, f"已生成新 API Key（立即生效，旧 Key 失效）:\n{cfg['api_key']}")
 
 
+_last_tui = 0.0
+
+
 def on_open_tui(icon, _):
+    """打开 TUI 控制台（托盘左键默认动作；防抖避免双击触发两次）"""
+    global _last_tui
+    if time.time() - _last_tui < 2:
+        return
+    _last_tui = time.time()
     python_exe = sys.executable.replace("pythonw.exe", "python.exe")
     subprocess.Popen([python_exe, os.path.join(BASE_DIR, "tui.py")],
                      cwd=BASE_DIR, creationflags=subprocess.CREATE_NEW_CONSOLE)
@@ -281,6 +289,7 @@ def main():
         menu = pystray.Menu(
             pystray.MenuItem(status_text, None, enabled=False),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("打开 TUI 控制台（左键双击图标）", on_open_tui, default=True),
             pystray.MenuItem("复制 Chat 端点", on_copy_endpoint),
             pystray.MenuItem("复制 API Key", on_copy_key),
             pystray.MenuItem("重新生成 API Key", on_regen_key),
@@ -289,7 +298,6 @@ def main():
             pystray.MenuItem("测试对话", on_test_chat),
             pystray.MenuItem("登录 / 更新 Cookie", on_login),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("打开 TUI 控制台", on_open_tui),
             pystray.MenuItem("退出", on_quit),
         )
         icon = pystray.Icon("chat2api", make_icon("gray"), "chat2api 启动中...", menu=menu)

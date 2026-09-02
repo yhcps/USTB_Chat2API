@@ -279,9 +279,8 @@ def main():
             pythonw = sys.executable.replace("python.exe", "pythonw.exe")
             subprocess.Popen([pythonw, os.path.join(BASE_DIR, "tray.py")], cwd=BASE_DIR)
             os.system("cls")
-            print("TUI 已隐藏，服务转由系统托盘常驻管理（任务栏右下角图标）。")
-            print("回到 TUI: 托盘图标右键 -> 打开 TUI 控制台。窗口 3 秒后关闭...")
-            time.sleep(3)
+            print("TUI 已隐藏，服务转由系统托盘常驻管理（任务栏右下角图标，左键点击图标可重新打开本控制台）。")
+            time.sleep(1)
             return
         handle_key(k, cfg)
 
