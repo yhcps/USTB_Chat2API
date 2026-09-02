@@ -341,6 +341,11 @@ def load_config() -> dict:
     return {**DEFAULT_CONFIG, **cfg}
 
 
+def get_host() -> str:
+    """监听地址: 默认仅本机; SOLO 等云端沙箱场景可设为 0.0.0.0 走局域网 IP 访问"""
+    return load_config().get("host", "127.0.0.1")
+
+
 app = FastAPI(title="USTB DeepSeek chat2api")
 
 
@@ -605,6 +610,6 @@ async def models(request: Request):
 if __name__ == "__main__":
     import uvicorn
     cfg = load_config()
-    print(f"chat2api 启动: http://127.0.0.1:{PORT}/v1")
+    print(f"chat2api 启动: http://{get_host()}:{PORT}/v1")
     print(f"API Key: {cfg['api_key']}  |  Cookies: {'已配置' if cfg['cookies'].get('easy_session') else '未配置，请运行 python update_cookies.py'}")
-    uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")
+    uvicorn.run(app, host=get_host(), port=PORT, log_level="warning")
