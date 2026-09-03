@@ -74,7 +74,7 @@ def service_online():
 def start_server():
     def run():
         import uvicorn
-        uvicorn.run(chat2api.app, host=chat2api.get_host(), port=PORT, log_level="warning")
+        uvicorn.run(chat2api.app, host=get_host(), port=PORT, log_level="warning")
     threading.Thread(target=run, daemon=True, name="uvicorn").start()
 
 

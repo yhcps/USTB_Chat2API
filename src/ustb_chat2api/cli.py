@@ -17,11 +17,8 @@ USTB Chat2API 命令行工具箱（合并原 update_cookies.py 与 manage_keys.p
 - 自动模式使用独立配置目录 .browser_profile，登录一次后 profile 保留会话，
   下次更新通常无需重新登录（学校 SSO 会话过期除外）
 """
-import hashlib
 import json
 import os
-import secrets
-import string
 import subprocess
 import sys
 import time
@@ -29,6 +26,7 @@ import time
 import requests
 
 from .utils import BASE_DIR, CONFIG_DIR, CONFIG_FILE, PORT, load_config  # noqa: E402
+from .utils import key_generate as _key_generate, key_list as _key_list, key_revoke as _key_revoke  # noqa: E402
 
 # ---------- Cookie 提取常量 ----------
 PROFILE_DIR = os.path.join(BASE_DIR, ".browser_profile")
@@ -45,11 +43,6 @@ BROWSER_CANDIDATES = [
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
     os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
 ]
-
-# ---------- API Key 常量 ----------
-KEYS_FILE = os.path.join(CONFIG_DIR, "api_keys.json")
-KEY_PREFIX = "sk-ustb-"
-KEY_ALPHABET = string.ascii_letters + string.digits  # 与 OpenAI key 相同的 base62 字符集
 
 
 # ==================== Cookie 部分 ====================
@@ -172,68 +165,6 @@ def cookie_port(port: int):
     verify_cookies(found)
 
 
-# ==================== API Key 部分 ====================
-
-def _load_keys():
-    if os.path.exists(KEYS_FILE):
-        with open(KEYS_FILE, encoding="utf-8") as f:
-            return json.load(f).get("keys", [])
-    return []
-
-
-def _save_keys(keys):
-    with open(KEYS_FILE, "w", encoding="utf-8") as f:
-        json.dump({"keys": keys}, f, ensure_ascii=False, indent=2)
-
-
-def key_generate(name: str):
-    keys = _load_keys()
-    full_key = KEY_PREFIX + "".join(secrets.choice(KEY_ALPHABET) for _ in range(48))
-    keys.append({
-        "name": name,
-        "key_hash": hashlib.sha256(full_key.encode()).hexdigest(),
-        "key_prefix": full_key[:16] + "...",
-        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "disabled": False,
-    })
-    _save_keys(keys)
-    print(f"[OK] 已生成 API Key (名称: {name})")
-    print(f"     {full_key}")
-    print("     请立即保存，明文不会再次显示。")
-    print("\n使用方式:")
-    print(f'  curl http://127.0.0.1:{PORT}/v1/models -H "Authorization: Bearer {full_key}"')
-
-
-def key_list():
-    keys = _load_keys()
-    if not keys:
-        print("暂无 key，先运行: python cli.py key generate [名称]")
-        return
-    print(f"共 {len(keys)} 个 key:")
-    for i, k in enumerate(keys, 1):
-        status = "已吊销" if k.get("disabled") else "有效"
-        print(f"  {i}. {k['key_prefix']}  名称={k['name']}  创建={k['created']}  状态={status}")
-
-
-def key_revoke(prefix: str):
-    keys = _load_keys()
-    prefix = prefix.rstrip(".")
-
-    def matches(k):
-        p = k["key_prefix"].rstrip(".")
-        return p.startswith(prefix) or p[len(KEY_PREFIX):].startswith(prefix)
-
-    hit = [k for k in keys if matches(k) and not k.get("disabled")]
-    if not hit:
-        print(f"未找到前缀为 {prefix} 的有效 key")
-        sys.exit(1)
-    for k in hit:
-        k["disabled"] = True
-    _save_keys(keys)
-    for k in hit:
-        print(f"[OK] 已吊销 {k['key_prefix']} (名称: {k['name']})")
-
-
 # ==================== 入口 ====================
 
 def main(argv: list) -> int:
@@ -254,14 +185,14 @@ def main(argv: list) -> int:
     elif cmd == "key":
         sub = rest[0] if rest else ""
         if sub == "generate":
-            key_generate(rest[1] if len(rest) > 1 else f"key-{int(time.time())}")
+            _key_generate(rest[1] if len(rest) > 1 else f"key-{int(time.time())}")
         elif sub == "list":
-            key_list()
+            _key_list()
         elif sub == "revoke":
             if len(rest) < 2:
                 print("用法: python cli.py key revoke <key前缀>")
                 return 1
-            key_revoke(rest[1])
+            _key_revoke(rest[1])
         else:
             print(__doc__)
             return 1

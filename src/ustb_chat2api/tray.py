@@ -69,7 +69,7 @@ def start_server():
         try:
             import uvicorn
             # pythonw 下 sys.stdout 为 None, uvicorn 默认日志配置会崩溃, 须禁用
-            uvicorn.run(chat2api.app, host=chat2api.get_host(), port=PORT,
+            uvicorn.run(chat2api.app, host=get_host(), port=PORT,
                         log_level="warning", log_config=None, access_log=False)
         except Exception:
             log("uvicorn 线程异常:\n" + traceback.format_exc())

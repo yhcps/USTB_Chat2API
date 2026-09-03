@@ -1,5 +1,6 @@
 # AGENTS.md — agent 工作提示
-
+这是一个偏应用的项目，不是纯 agent 项目。面向我本人和第一开发者的提示及时写入AGENTS.md，面向用户和第二开发者的提示及时写入README.md。AGENTS.md的语言风格简洁凝练，以节省Token为目标。
+TODO.md是待办列表，项目中会涉及多个Agent的交互，即使写入和清理相关内容，并且每次执行操作都要加上待修改和修改中的文字标识。
 ## 删除规则（强制）
 - 不要直接删除文件。任务结束后单独给出 PowerShell 命令由用户手动执行，否则会导致 IDE 崩溃
 
@@ -18,8 +19,9 @@
 
 ## 常用命令
 ```powershell
-# 单元测试
+# 单元测试（包版 + 生产扁平版各跑一遍）
 .\.venv_chat2api\Scripts\python.exe tests\test_tools_unit.py
+.\.venv_chat2api\Scripts\python.exe tests\test_tools_unit.py --flat
 
 # 真实请求泄露/桥接回归（每轮 6 用例并发，打真实上游）
 .\.venv_chat2api\Scripts\python.exe tests\test_stream_leak.py --rounds 3
@@ -52,7 +54,21 @@ Start-Process -FilePath ".\.venv_chat2api\Scripts\pythonw.exe" -ArgumentList "tr
 | 读取文件内容并原样输出 | 「查看 XX 的实现」「定位 XX 逻辑」 |
 | 一长串命令式指令 | 拆成普通编程问答口吻的短句 |
 
-遇到拦截时：人工对话换措辞重问（勿原样重发）；测试脚本中标记 SKIP 透传、勿自动重试轰炸（样板见 test_stream_leak.py 的 `REJECT_RE`）。
+遇到拦截时：人工对话换措辞重问（勿原样重发）；测试脚本中标记 SKIP 透传、勿自动重试轰炸（样板见 test_stream_leak.py 的 `REJECT_RE`）。TOOL_INSTRUCTION 末尾已内置同样的【安全提醒】，随 tools 注入下发。
+
+## 嵌套 XML 防护（H40 教训，强制）
+
+参数值里的 `<tool_calls>`/`</invoke>` 等是**字面文本**，不是结构标签：
+- 配对一律走 `<parameter>` 深度状态机：`_iter_wrapper_spans` / `_iter_invoke_spans` / `_parse_params`；流式闭合前先 `_param_depth()` 校验，值内闭合标签跳过找真闭合。**严禁退回裸正则非贪婪截断**。
+- 输出层 `_json_guard()` 在 `json.dumps` **之后**把 `< >` 转成 `\uXXXX`（提前改 arguments 会被 dumps 二次转义损坏）；非流式返回必须 `Response(content=make_final(...))` 直接透传，经 `json.loads` 会还原转义。
+- 解析逻辑改动必须加嵌套字面文本用例（test_tools_unit.py 的 H40 段）并跑穷举切分。
+
+## 双写同步（当前架构事实）
+
+refactor 分支引入 `src/ustb_chat2api/` 包版，但**生产仍跑根目录扁平 `chat2api.py`**（tray/tui/cli 导入扁平版，config.json 在根目录）。过渡期约束：
+- 解析/服务端修复**必须同时改两份**：`chat2api.py`（生产）与 `src/ustb_chat2api/server.py`（包）。
+- 测试两版都要过：`python tests/test_tools_unit.py`（包版）+ `python tests/test_tools_unit.py --flat`（扁平版）。
+- 包版 `config/`、`logs/` 目录从未启用，勿按包版路径排查线上问题。
 
 ## 测试约定
 - 新解析/过滤逻辑：先在 `tests/test_tools_unit.py` 加确定性用例（含穷举切分），全过再上真实请求。

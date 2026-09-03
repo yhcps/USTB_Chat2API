@@ -6,8 +6,20 @@ import os
 import sys
 import json
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import chat2api as c
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, "src"))  # refactor 包结构优先
+# 双写同步：默认测包版，--flat 强制测生产扁平版（两份实现都必须过同一套件）
+if "--flat" in sys.argv:
+    import chat2api as c
+    print(f"== 目标实现: chat2api.py (扁平) ==")
+else:
+    try:
+        from ustb_chat2api import server as c  # 打包后的实现
+        print("== 目标实现: ustb_chat2api.server (包) ==")
+    except ImportError:
+        import chat2api as c  # master 扁平结构回退
+        print("== 目标实现: chat2api.py (扁平, 回退) ==")
 
 PASS = FAIL = 0
 
@@ -269,6 +281,71 @@ for i in range(0, len(psample) + 1, 4):
         if txt != "前文尾文" or len(evs) != 2:
             pbad3.append((i, j))
 check("content三片抽样切分" + (f"，异常位:{pbad3[:6]}" if pbad3 else "全部无损"), not pbad3)
+
+print("== H40 嵌套 XML（参数值内含标签字面文本）==")
+
+# _json_guard：JSON 文本层 < > 转义，合规解析器可还原
+g = c._json_guard('{"code": "<tool_calls>ok</tool_calls>"}')
+check("json_guard转义", "<" not in g and ">" not in g and "\\u003c" in g and "\\u003e" in g)
+check("json_guard可逆", json.loads(g)["code"] == "<tool_calls>ok</tool_calls>")
+
+
+def _stream_split(pieces, names=("Write",)):
+    pp = c.ToolCallStreamParser(list(names))
+    parts = [pp.feed(t) for t in pieces]
+    tail, tev = pp.flush()
+    txt = "".join(x[0] for x in parts) + tail
+    evs = [e for x in parts for e in x[1]] + tev
+    return txt, evs
+
+
+# Write 参数值内含完整工具调用 XML 字面文本（H40 真实场景：代码构造工具调用示例）
+nested = ('<tool_calls><invoke name="Write"><parameter name="code">'
+          'demo = "<tool_calls><invoke name=\\"L\\"><parameter name=\\"p\\">1</parameter>'
+          '</invoke></tool_calls>"'
+          '</parameter></invoke></tool_calls>')
+expected_code = ('demo = "<tool_calls><invoke name=\\"L\\">'
+                 '<parameter name=\\"p\\">1</parameter></invoke></tool_calls>"')
+
+clean, tcs = c.extract_tool_calls(nested, ["Write"])
+check("非流式嵌套XML提取", clean == "" and len(tcs) == 1
+      and json.loads(tcs[0]["function"]["arguments"]).get("code") == expected_code)
+
+# 非流式同块多 invoke（旧版 s<last 去重会漏掉同块的第二个调用）
+multi = ('<tool_calls><invoke name="A"><parameter name="x">1</parameter></invoke>'
+         '<invoke name="B"><parameter name="y">2</parameter></invoke></tool_calls>')
+clean, tcs = c.extract_tool_calls(multi, ["A", "B"])
+check("非流式同块多invoke", clean == "" and [t["function"]["name"] for t in tcs] == ["A", "B"])
+
+# 流式：断点落在值内字面 </tool_calls> 内外，不得误闭、参数须完整
+k = nested.index("</tool_calls>")  # 值内首个字面闭合
+bad = []
+for off in (-6, -3, 0, 3, 6):
+    txt, evs = _stream_split([nested[:k + off], nested[k + off:]])
+    if txt != "" or len(evs) != 1:
+        bad.append(off)
+    elif json.loads(evs[0]["function"]["arguments"]).get("code") != expected_code:
+        bad.append(("args", off))
+check("流式嵌套XML切分" + (f"，异常:{bad[:4]}" if bad else "全部无损"), not bad)
+
+# 流式裸 invoke：值内字面 </invoke> 不得提前闭合
+bare = ('<invoke name="Echo"><parameter name="text">he said "</invoke>" loudly'
+        '</parameter></invoke>')
+txt, evs = _stream_split([bare], names=("Echo",))
+check("流式裸invoke值内闭合标签", txt == "" and len(evs) == 1
+      and json.loads(evs[0]["function"]["arguments"]).get("text") == 'he said "</invoke>" loudly')
+
+# 输出层：chunk / final 无裸尖括号，且 JSON 解析还原无损
+chunk = c.make_chunk("t", "m", {"tool_calls": [{"index": 0, "id": "c1", "type": "function",
+                                                "function": {"name": "Write",
+                                                             "arguments": '{"code": "<b>x</b>"}'}}]})
+check("chunk无裸尖括号", "<" not in chunk and "\\u003c" in chunk)
+fin = c.make_final("t", "m", "", None, {}, tool_calls=[{"id": "c2", "type": "function",
+                                                        "function": {"name": "Write",
+                                                                     "arguments": '{"code": "<tool_calls>x</tool_calls>"}'}}])
+check("final无裸尖括号", "<" not in fin and "\\u003c" in fin)
+back = json.loads(fin)["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+check("final解析还原", json.loads(back)["code"] == "<tool_calls>x</tool_calls>")
 
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

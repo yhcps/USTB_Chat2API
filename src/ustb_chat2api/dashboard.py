@@ -9,8 +9,10 @@
 usage 缺失时 tokens 按字符数估算（约 2.5 字符/token，中英混合粗略值）并标记 estimated。
 """
 import json
+import os
 import threading
 import time
+import atexit
 from collections import deque
 
 from fastapi import APIRouter
@@ -97,6 +99,7 @@ async def stats():
             "total_errors": _STATS["total_errors"],
             "total_prompt_tokens": _STATS["total_prompt_tokens"],
             "total_completion_tokens": _STATS["total_completion_tokens"],
+            "total_context_tokens": _STATS["total_prompt_tokens"] + _STATS["total_completion_tokens"],
             "recent": list(_STATS["recent"]),
             "tps_series": list(_STATS["tps_series"]),
         }
@@ -132,6 +135,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="card"><div class="k">吐词速度（最近请求）</div><div class="v"><span id="tps">--</span> tok/s</div></div>
   <div class="card"><div class="k">最近上下文用量</div><div class="v"><span id="ctx">--</span> tok</div></div>
   <div class="card"><div class="k">累计 tokens (入/出)</div><div class="v" style="font-size:18px"><span id="tot">--</span></div></div>
+  <div class="card"><div class="k">累计 token (总)</div><div class="v" style="font-size:18px"><span id="totctx">--</span></div></div>
   <div class="card"><div class="k">请求总数 / 错误</div><div class="v" style="font-size:18px"><span id="req">--</span></div></div>
   <div class="card"><div class="k">服务运行时长</div><div class="v" style="font-size:18px"><span id="up">--</span></div></div>
 </div>
@@ -144,6 +148,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 <script>
 const $ = id => document.getElementById(id);
 function fmtT(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?h+"h"+m+"m":m?m+"m"+Math.floor(s%60)+"s":Math.floor(s)+"s"}
+function fmtTok(n){return n>=1e6?(n/1e6).toFixed(2)+"M":n>=1e3?(n/1e3).toFixed(1)+"K":String(n)}
 function draw(series){
   const c=$("chart"),x=c.getContext("2d");x.clearRect(0,0,c.width,c.height);
   x.fillStyle="#374151";x.font="11px sans-serif";x.fillText("tokens/s 时间序列",8,14);
@@ -166,7 +171,8 @@ async function tick(){
     $("tps").textContent=last.tps!=null?last.tps:"--";
     const lc=[...s.recent].reverse()[0];
     $("ctx").textContent=lc?lc.prompt_tokens:"--";
-    $("tot").textContent=s.total_prompt_tokens+" / "+s.total_completion_tokens;
+    $("tot").textContent=fmtTok(s.total_prompt_tokens)+" / "+fmtTok(s.total_completion_tokens);
+    $("totctx").textContent=fmtTok(s.total_context_tokens);
     $("req").textContent=s.total_requests+" / "+s.total_errors;
     $("up").textContent=fmtT(s.uptime_s);
     draw(s.tps_series);
