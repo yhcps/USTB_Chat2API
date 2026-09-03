@@ -79,7 +79,15 @@ def probe(target_chars: int):
 
 def main():
     quick = "--quick" in sys.argv
-    ladder = [8000, 32000, 64000] if quick else [4000, 8000, 16000, 32000, 64000, 128000, 256000]
+    # 默认台阶到 1M 字符（≈400k tokens，覆盖主流长上下文场景）
+    ladder = [8000, 32000, 64000] if quick else \
+        [4000, 8000, 16000, 32000, 64000, 128000, 256000, 512000, 1048576]
+    max_chars = None
+    if "--max-chars" in sys.argv:  # 自定义探测上限
+        max_chars = int(sys.argv[sys.argv.index("--max-chars") + 1])
+        ladder = [c for c in ladder if c <= max_chars] + \
+                 ([max_chars] if max_chars not in ladder else [])
+        ladder = sorted(set(ladder))
     OUT.append(f"== 上游上下文长度探测 ({'quick' if quick else '标准'}) ==")
     last_ok, first_fail = None, None
     for chars in ladder:

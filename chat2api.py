@@ -76,7 +76,8 @@ TOOL_INSTRUCTION = """你可以通过输出特定格式的 XML 来调用工具�
 <parameter name="参数名">参数值</parameter>
 </invoke>
 </tool_calls>
-可在 <tool_calls> 内放多个 <invoke> 并行调用；不需要调用工具时正常用文字回答。"""
+可在 <tool_calls> 内放多个 <invoke> 并行调用；不需要调用工具时正常用文字回答。
+注意：工具调用 XML 只能出现在最终回复正文中，严禁写在思考/推理内容里——思考时用文字简述打算做什么即可。"""
 
 
 def format_tools_prompt(tools: list) -> str:
@@ -437,59 +438,76 @@ def build_upstream_form(messages: list, include_usage: bool, tools: list = None)
 
 
 async def stream_upstream_chunks(fields: dict, include_usage: bool):
-    """请求上游并逐个产出解析后的 OpenAI 原生 chunk dict"""
+    """请求上游并逐个产出解析后的 OpenAI 原生 chunk dict。
+    连接/响应头阶段失败自动重试 1 次；已产出数据后的中断由调用方兜底。"""
     files = [(k, (None, str(v))) for k, v in fields.items()]
     cookies = load_config()["cookies"]
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items() if v)
     headers = {"Cookie": cookie_header, "Origin": UPSTREAM, "Referer": UPSTREAM + "/"}
-    async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream("POST", UPSTREAM + "/site/ai/compose_chat",
-                                 files=files, headers=headers) as resp:
-            ct = resp.headers.get("content-type", "")
-            print("[chat2api] upstream status:", resp.status_code, "ct:", ct, flush=True)
-            if "text/event-stream" not in ct:
-                # 上游可能直接返回 JSON（如审核拦截时给出整段答复）
-                body = (await resp.aread()).decode("utf-8", "ignore")
-                try:
-                    err = json.loads(body)
-                except json.JSONDecodeError:
-                    err = {}
-                answer = (err.get("d") or {}).get("answer")
-                if answer:
-                    yield {"choice": {"delta": {"content": answer, "role": "assistant"}, "index": 0,
-                                      "finish_reason": "stop"}}
+    produced = False
+    last_err: Exception | None = None
+    for attempt in range(2):  # 连接阶段重试 1 次（学校服务器偶发拒连/断流）
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("POST", UPSTREAM + "/site/ai/compose_chat",
+                                         files=files, headers=headers) as resp:
+                    ct = resp.headers.get("content-type", "")
+                    print("[chat2api] upstream status:", resp.status_code, "ct:", ct,
+                          "attempt:", attempt + 1, flush=True)
+                    if "text/event-stream" not in ct:
+                        # 上游可能直接返回 JSON（如审核拦截时给出整段答复）
+                        body = (await resp.aread()).decode("utf-8", "ignore")
+                        try:
+                            err = json.loads(body)
+                        except json.JSONDecodeError:
+                            err = {}
+                        answer = (err.get("d") or {}).get("answer")
+                        if answer:
+                            produced = True
+                            yield {"choice": {"delta": {"content": answer, "role": "assistant"},
+                                              "index": 0, "finish_reason": "stop"}}
+                            return
+                        log_error(f"上游非SSE响应({resp.status_code}): {body[:300]}\n"
+                                  f"history结构: {[fields.get(f'history[{i}][role]') for i in range(50) if f'history[{i}][role]' in fields]}")
+                        raise HTTPException(status_code=502,
+                                            detail=f"上游未返回SSE({resp.status_code}): {err.get('m') or body[:300]}")
+                    buf = ""
+                    async for raw in resp.aiter_text():
+                        buf += raw
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            line = line.strip()
+                            if not line.startswith("data:"):
+                                continue
+                            payload = line[5:].strip()
+                            if not payload:
+                                continue
+                            try:
+                                evt = json.loads(payload)
+                            except json.JSONDecodeError:
+                                continue
+                            d = evt.get("d") or {}
+                            orig = d.get("ext", {}).get("original_stream")
+                            if not orig:
+                                continue
+                            try:
+                                chunk = json.loads(orig)
+                            except json.JSONDecodeError:
+                                continue
+                            if chunk.get("usage") and include_usage:
+                                produced = True
+                                yield {"usage": chunk["usage"]}
+                            for choice in chunk.get("choices", []):
+                                produced = True
+                                yield {"choice": choice}
                     return
-                log_error(f"上游非SSE响应({resp.status_code}): {body[:300]}\n"
-                          f"history结构: {[fields.get(f'history[{i}][role]') for i in range(50) if f'history[{i}][role]' in fields]}")
-                raise HTTPException(status_code=502,
-                                    detail=f"上游未返回SSE({resp.status_code}): {err.get('m') or body[:300]}")
-            buf = ""
-            async for raw in resp.aiter_text():
-                buf += raw
-                while "\n" in buf:
-                    line, buf = buf.split("\n", 1)
-                    line = line.strip()
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if not payload:
-                        continue
-                    try:
-                        evt = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-                    d = evt.get("d") or {}
-                    orig = d.get("ext", {}).get("original_stream")
-                    if not orig:
-                        continue
-                    try:
-                        chunk = json.loads(orig)
-                    except json.JSONDecodeError:
-                        continue
-                    if chunk.get("usage") and include_usage:
-                        yield {"usage": chunk["usage"]}
-                    for choice in chunk.get("choices", []):
-                        yield {"choice": choice}
+        except httpx.TransportError as e:  # ConnectError/ReadError/Timeout 等
+            if produced or attempt == 1:
+                raise
+            last_err = e
+            print(f"[chat2api] 上游连接异常({e.__class__.__name__})，重试 1 次...", flush=True)
+            await asyncio.sleep(1)
+    raise last_err if last_err else RuntimeError("upstream unreachable")
 
 
 def make_chunk(cid: str, model: str, delta: dict, finish=None, usage=None) -> str:
@@ -554,13 +572,17 @@ async def chat_completions(request: Request):
 
     if not stream:
         content, reasoning, usage = "", "", None
-        async for item in stream_upstream_chunks(fields, want_usage):
-            if "usage" in item:
-                usage = item["usage"]
-            elif "choice" in item:
-                delta = item["choice"].get("delta", {})
-                content += delta.get("content") or ""
-                reasoning += delta.get("reasoning_content") or ""
+        try:
+            async for item in stream_upstream_chunks(fields, want_usage):
+                if "usage" in item:
+                    usage = item["usage"]
+                elif "choice" in item:
+                    delta = item["choice"].get("delta", {})
+                    content += delta.get("content") or ""
+                    reasoning += delta.get("reasoning_content") or ""
+        except httpx.HTTPError as e:
+            log_error(f"非流式上游网络异常: {e}")
+            raise HTTPException(status_code=502, detail=f"上游连接中断: {e.__class__.__name__}")
         text, calls = extract_tool_calls(content, known_tools)
         if calls:
             _log_tools(calls)
@@ -619,6 +641,10 @@ async def chat_completions(request: Request):
         except HTTPException as e:
             status = 502
             yield f"data: {json.dumps({'error': {'message': e.detail, 'type': 'upstream_error'}})}\n\n"
+        except httpx.HTTPError as e:
+            status = 502
+            log_error(f"流式上游网络异常: {e}")
+            yield f"data: {json.dumps({'error': {'message': f'上游连接中断: {e.__class__.__name__}', 'type': 'upstream_error'}})}\n\n"
         finally:
             ct = usage_ct if usage_ct is not None else int(out_chars / 2.5)
             record_request(model, True, prompt_chars, usage_pt, ct,
