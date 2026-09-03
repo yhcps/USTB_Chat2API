@@ -254,6 +254,12 @@ def on_open_tui(icon, _):
                      cwd=BASE_DIR, creationflags=subprocess.CREATE_NEW_CONSOLE)
 
 
+def on_open_dashboard(icon, _):
+    """在默认浏览器中打开 Dashboard"""
+    import webbrowser
+    webbrowser.open(f"http://127.0.0.1:{PORT}/dashboard")
+
+
 def on_quit(icon, _):
     icon.stop()
     os._exit(0)
@@ -290,6 +296,7 @@ def main():
             pystray.MenuItem(status_text, None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("打开 TUI 控制台（左键双击图标）", on_open_tui, default=True),
+            pystray.MenuItem("打开 Dashboard", on_open_dashboard),
             pystray.MenuItem("复制 Chat 端点", on_copy_endpoint),
             pystray.MenuItem("复制 API Key", on_copy_key),
             pystray.MenuItem("重新生成 API Key", on_regen_key),

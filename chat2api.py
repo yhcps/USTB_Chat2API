@@ -117,6 +117,14 @@ _NAME_ATTR_RE = re.compile(r'name\s*=\s*["\']?([^"\'<>\s=]+)', re.I)
 _PARAM_OPEN_RE = re.compile(r'<parameter\b([^>]*)>', re.I)
 _FENCE_TAIL_RE = re.compile(r'(```xml|```)\s*$', re.I)
 _FENCE_HEAD_RE = re.compile(r'^\s*(```xml|```)[ \t]*\n?', re.I)
+# 流式开始/结束标签识别：容忍大小写与标签内空白（模型偶发 <tool_calls >、<TOOL_CALLS>）
+_TC_OPEN_RE = re.compile(r'<tool_calls\s*>', re.I)
+_TCC_OPEN_RE = re.compile(r'<tool_call\s*>', re.I)
+_INVOKE_OPEN_RE = re.compile(r'<invoke\b', re.I)
+_CLOSER_RES = {"tc": re.compile(r'</tool_calls\s*>', re.I),
+               "single": re.compile(r'</tool_call\s*>', re.I),
+               "inv": re.compile(r'</invoke\s*>', re.I)}
+_CLOSER_KEEP = 12  # 最长闭合标签 '</tool_calls>' 长度-1，流式扣住尾部防 closer 被分片拆开漏检
 
 
 def _parse_params(body: str) -> dict:
@@ -199,6 +207,79 @@ def extract_tool_calls(text: str, known_tools: list):
     return "".join(clean).strip(), calls
 
 
+class ReasoningXMLFilter:
+    """思考内容(reasoning)流式过滤器：剥离其中的工具调用 XML。
+
+    背景：模型偶尔违规把 <tool_calls>/<invoke> XML 写进思考区（TOOL_INSTRUCTION
+    已禁止但无法 100% 保证），Trae 渲染思考内容时会把 <> 原文当回答直出——
+    与 Ollama/Nemotron <think> 标签泄露同类问题。业界通用解法是代理层有状态
+    流式过滤（thinkstrip、newt-agent#385 同思路）：跨分片追踪标签边界，块内
+    内容整体丢弃。正文通道的工具调用桥不受影响——真正的调用由正文桥转换。"""
+
+    # 注意：不能用 \b 收尾——分片在 '<tool_call'/'<tool_calls' 处断开时 \b 视为词边界，
+    # 会把半截前缀误当完整开标签消费掉（'s>' 成孤儿、闭合永不匹配、后续思考被整段吞掉）。
+    # 必须要求标签名后紧跟 >/空白// 才算开标签，其余情况交给 _hold 扣住等下一分片。
+    OPEN_RE = re.compile(r'<(tool_calls|tool_call(?!s)|invoke)(?=[\s>/])', re.I)
+    _OPEN_CAND = ("<tool_calls", "<tool_call", "<invoke")      # 跨分片拆开的开始标签前缀
+    _CLOSE_CAND = ("</tool_calls", "</tool_call", "</invoke")  # 跨分片拆开的结束标签前缀
+
+    def __init__(self):
+        self.pending = ""     # 尾部疑似被拆分的标签前缀，扣住等下一分片
+        self.suppress = False  # True=正在 XML 块内，丢弃内容
+        self.tag = None       # 当前块类型: 'tool_calls' | 'invoke'（决定闭合标签）
+
+    @staticmethod
+    def _hold(buf: str, candidates) -> int:
+        """buf 尾部若是某候选标签被拆开的前缀（如 '<tool_'），返回需扣住的长度"""
+        # 上界不带 -1：分片恰好在 '<tool_calls' 与 '>' 之间断开时也要整体扣住，
+        # 否则 '<' 起始的半截标签泄出，且对应的闭合标签随后也会跟泄露
+        for k in range(min(len(buf), max(map(len, candidates))), 0, -1):
+            tail = buf[-k:].lower()
+            if any(p.startswith(tail) for p in candidates):
+                return k
+        return 0
+
+    def feed(self, text: str) -> str:
+        """输入 reasoning 增量 -> 应输出的 reasoning 增量"""
+        if not text:
+            return ""
+        out, buf = [], self.pending + text
+        while True:
+            if self.suppress:
+                # 只匹配与开块对应的闭合标签：外层 tool_calls 内的 </invoke>
+                # 不能提前结束抑制（否则外层 </tool_calls> 会泄露为正文）
+                m = re.search(rf'</{self.tag}\s*>', buf, re.I)
+                if m:  # XML 块结束，恢复输出（块内内容已丢弃）
+                    buf = buf[m.end():]
+                    self.suppress = False
+                    self.tag = None
+                    continue
+                hold = self._hold(buf, self._CLOSE_CAND)
+                self.pending = buf[len(buf) - hold:] if hold else ""
+                break
+            m = self.OPEN_RE.search(buf)
+            if m:  # 进入 XML 块
+                out.append(buf[:m.start()])
+                self.suppress = True
+                self.tag = m.group(1).lower()
+                buf = buf[m.end():]
+                continue
+            hold = self._hold(buf, self._OPEN_CAND)
+            out.append(buf[:len(buf) - hold])
+            self.pending = buf[len(buf) - hold:] if hold else ""
+            break
+        return "".join(out)
+
+    def flush(self) -> str:
+        """流结束：suppress 中说明 XML 未闭合（违规输出），整体丢弃；
+        pending 恒为 '<' 开头的标签前缀碎片，未闭合即失效，一并丢弃（防半截标签泄露）"""
+        self.pending = ""
+        if self.suppress:
+            self.suppress = False
+            self.tag = None
+        return ""
+
+
 class ToolCallStreamParser:
     """流式增量检测工具调用 XML，避免把 <> 原文透传给客户端。
     支持 <tool_calls>/<tool_call> 包裹、裸 <invoke>、自闭合已知工具标签，
@@ -256,9 +337,10 @@ class ToolCallStreamParser:
                         continue
                 sc = self._match_selfclosing(self.buf)
                 sc_pos = sc[0].start() if sc else None
-                idx = [i for i in (self.buf.find("<tool_calls>"),
-                                   self.buf.find("<tool_call>"),
-                                   self.buf.find("<invoke")) if i != -1]
+                m_tc = _TC_OPEN_RE.search(self.buf)
+                m_tcc = _TCC_OPEN_RE.search(self.buf)
+                m_inv = _INVOKE_OPEN_RE.search(self.buf)
+                idx = [m.start() for m in (m_tc, m_tcc, m_inv) if m]
                 if sc_pos is not None:
                     idx.append(sc_pos)
                 if not idx:
@@ -275,31 +357,35 @@ class ToolCallStreamParser:
                     piece = _FENCE_TAIL_RE.sub('', self.buf[:cut], count=1)  # 块前 ```xml 围栏
                     if piece:
                         out_c.append(piece)
-                    self.buf = self.buf[cut:]
-                if sc_pos is not None and cut == sc_pos and \
-                        not self.buf.startswith(("<tool_calls>", "<tool_call>", "<invoke")):
+                    tail = self.buf[cut:]
+                else:
+                    tail = self.buf
+                # cut 处分类：包裹开标签 / 裸 invoke / 自闭合（均容忍额外属性与空白）
+                if m_tc and m_tc.start() == cut:
+                    self.mode, self.acc = "tc", ""
+                    tail = tail[m_tc.end() - cut:]
+                elif m_tcc and m_tcc.start() == cut:
+                    self.mode, self.acc = "single", ""
+                    tail = tail[m_tcc.end() - cut:]
+                elif m_inv and m_inv.start() == cut:
+                    self.mode, self.acc = "inv", ""  # closer 到达后整体解析
+                else:  # 自闭合已知工具标签
                     m, call = sc
                     out_t.append(self._evt(call))
                     self._after_block = True
-                    self.buf = self.buf[m.end():]
-                elif self.buf.startswith("<tool_calls>"):
-                    self.mode, self.acc = "tc", ""
-                    self.buf = self.buf[len("<tool_calls>"):]
-                elif self.buf.startswith("<tool_call>"):
-                    self.mode, self.acc = "single", ""
-                    self.buf = self.buf[len("<tool_call>"):]
-                else:  # <invoke...：closer 到达后整体解析
-                    self.mode, self.acc = "inv", ""
+                    tail = tail[m.end() - cut:]
+                self.buf = tail
             else:
-                closer = {"tc": "</tool_calls>", "single": "</tool_call>",
-                          "inv": "</invoke>"}[self.mode]
-                end = self.buf.find(closer)
-                if end == -1:
-                    self.acc += self.buf
-                    self.buf = ""
+                cm = _CLOSER_RES[self.mode].search(self.buf)
+                if not cm:
+                    # closer 可能被分片拆在 acc/buf 边界（如 '...</tool_call' + 's>'）：
+                    # 扣住尾部窗口（最长 closer 长度-1）并入下次匹配，其余先入 acc
+                    keep = min(len(self.buf), _CLOSER_KEEP)
+                    self.acc += self.buf[:len(self.buf) - keep]
+                    self.buf = self.buf[len(self.buf) - keep:]
                     break
-                self.acc += self.buf[:end]
-                self.buf = self.buf[end + len(closer):]
+                self.acc += self.buf[:cm.start()]
+                self.buf = self.buf[cm.end():]
                 xml = self.acc if self.mode in ("tc", "single") else self.acc + "</invoke>"
                 for c in parse_invokes_xml(xml):
                     out_t.append(self._evt(c))
@@ -572,6 +658,7 @@ async def chat_completions(request: Request):
 
     if not stream:
         content, reasoning, usage = "", "", None
+        rfilter = ReasoningXMLFilter()  # 思考区 XML 剥离（与非流式路径保持一致）
         try:
             async for item in stream_upstream_chunks(fields, want_usage):
                 if "usage" in item:
@@ -579,7 +666,8 @@ async def chat_completions(request: Request):
                 elif "choice" in item:
                     delta = item["choice"].get("delta", {})
                     content += delta.get("content") or ""
-                    reasoning += delta.get("reasoning_content") or ""
+                    reasoning += rfilter.feed(delta.get("reasoning_content") or "")
+            reasoning += rfilter.flush()
         except httpx.HTTPError as e:
             log_error(f"非流式上游网络异常: {e}")
             raise HTTPException(status_code=502, detail=f"上游连接中断: {e.__class__.__name__}")
@@ -596,6 +684,7 @@ async def chat_completions(request: Request):
 
     async def sse():
         parser = ToolCallStreamParser(known_tools)
+        rfilter = ReasoningXMLFilter()  # 思考区 XML 剥离（Trae <> 直出治理）
         first_tok = None     # 首 token 延迟 s
         out_chars = 0        # 输出字符数（usage 缺失时估算用）
         usage_pt = usage_ct = None
@@ -617,7 +706,9 @@ async def chat_completions(request: Request):
                     if (reasoning or text) and first_tok is None:
                         first_tok = time.time() - t0
                     if reasoning:
-                        yield make_chunk(cid, model, {"reasoning_content": reasoning})
+                        r_txt = rfilter.feed(reasoning)
+                        if r_txt:
+                            yield make_chunk(cid, model, {"reasoning_content": r_txt})
                     if text:
                         out_chars += len(text)
                         out_c, out_t = parser.feed(text)
@@ -627,6 +718,9 @@ async def chat_completions(request: Request):
                             yield make_chunk(cid, model, {"tool_calls": [ev]})
                     if finish:
                         held_finish = finish  # 最后再发，保证 flush 事件先于结束帧
+            r_rest = rfilter.flush()
+            if r_rest:
+                yield make_chunk(cid, model, {"reasoning_content": r_rest})
             left, left_ev = parser.flush()
             for ev in left_ev:
                 yield make_chunk(cid, model, {"tool_calls": [ev]})
