@@ -213,8 +213,8 @@ def render(cfg):
     print(f"├─ 操作（单键） ──────────────────────────────────────────────┤")
     print(f"│  {BOLD}[1]{RESET} 复制端点   {BOLD}[2]{RESET} 复制 Base URL   {BOLD}[3]{RESET} 复制 API Key")
     print(f"│  {BOLD}[4]{RESET} 登录/更新 Cookie   {BOLD}[5]{RESET} 重新生成 Key")
-    print(f"│  {BOLD}[6]{RESET} 重新检测服务   {BOLD}[7]{RESET} 测试对话   {BOLD}[0]{RESET} 检测登录状态")
-    print(f"│  {BOLD}[h]{RESET} 隐藏到托盘（服务常驻）   {BOLD}[q]{RESET} 退出（停止服务）")
+    print(f"│  {BOLD}[6]{RESET} 重新检测服务   {BOLD}[7]{RESET} 测试对话   {BOLD}[8]{RESET} 打开 Dashboard")
+    print(f"│  {BOLD}[0]{RESET} 检测登录状态   {BOLD}[h]{RESET} 隐藏到托盘   {BOLD}[q]{RESET} 退出")
     print(f"└─────────────────────────────────────────────────────────────┘")
     if STATE["msg"]:
         color = GREEN if "✓" in STATE["msg"] else (RED if ("失败" in STATE["msg"] or "无效" in STATE["msg"]) else YELLOW)
@@ -246,6 +246,13 @@ def handle_key(k, cfg):
         STATE["msg"] = "测试对话发送中（上游思考约需数秒~数十秒）..."
         render(cfg)
         test_chat()
+    elif k == b"8":
+        if not service_online():
+            STATE["msg"] = f"服务未运行，Dashboard 无法打开（端口 {PORT} 无响应）"
+        else:
+            import webbrowser
+            webbrowser.open(f"http://127.0.0.1:{PORT}/dashboard")
+            STATE["msg"] = "已在浏览器中打开 Dashboard"
     elif k == b"0":
         STATE["session"] = check_session()
         STATE["msg"] = f"登录状态: {SESSION_TEXT.get(STATE['session'], '未知')}"

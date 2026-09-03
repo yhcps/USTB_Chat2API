@@ -256,6 +256,9 @@ def on_open_tui(icon, _):
 
 def on_open_dashboard(icon, _):
     """在默认浏览器中打开 Dashboard"""
+    if not service_online():
+        notify(icon, f"服务未运行，Dashboard 无法打开\n请先启动服务")
+        return
     import webbrowser
     webbrowser.open(f"http://127.0.0.1:{PORT}/dashboard")
 

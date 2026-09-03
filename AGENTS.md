@@ -45,3 +45,12 @@ Start-Process -FilePath ".\.venv_chat2api\Scripts\pythonw.exe" -ArgumentList "tr
 - 新解析/过滤逻辑：先在 `tests/test_tools_unit.py` 加确定性用例（含穷举切分），全过再上真实请求。
 - 真实请求验证用 `test_stream_leak.py`，判据是 reasoning/content 全文无 `<tool_calls>/<tool_call>/<invoke` 原文、tool_calls 事件 arguments 合法 JSON。
 - 临时调试脚本放 `tests/_debug_cases.py`，不并入正式测试。
+
+## 上游能力测试结果
+| 测试项 | 实测值 | 备注 |
+|---|---|---|
+| 上下文长度（标准） | ≥ 209214 字符 (~72883 prompt_tokens) | 251982 字符时 502 失败 |
+| 输出窗口 | ~61725 tokens (104170 字符) | 上游自然结束，未达 131072 目标 |
+| 输出速度 | ~111.3 tok/s | 555s 输出 61725 tokens |
+
+> 测试命令: `python tests/test_context_length.py` / `python tests/test_output_length.py`
