@@ -1,0 +1,11 @@
+== 上游上下文长度探测 (标准) ==
+FAIL chars=  251982  HTTP 502  body='{"detail":"上游未返回SSE(200): history参数异常"}'  dur=1s
+  回退: OK   chars=   63145  usage.prompt_tokens=22043  completion=4701  dur=49s
+  细化: OK   chars=  155754  usage.prompt_tokens=54283  completion=6971  dur=75s
+  细化: OK   chars=  201195  usage.prompt_tokens=70093  completion=2275  dur=27s
+  细化: FAIL chars=  223470  HTTP 502  body='{"detail":"上游未返回SSE(200): history参数异常"}'  dur=1s
+  细化: OK   chars=  209214  usage.prompt_tokens=72883  completion=2571  dur=34s
+
+结论: 上游可接受 ≥ 209214 字符 (约 209214 / 2.5 ≈ 83k tokens，上游实测 prompt_tokens=72883)
+        失败阈值: 251982
+建议: Trae 等 Agent 的单会话历史保持在上述字符数以内，超出前手动新开会话。

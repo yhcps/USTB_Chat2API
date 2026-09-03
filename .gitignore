@@ -24,6 +24,11 @@ venv/
 /probe_4028.py
 /verify_e2e.py
 
+# ===== 构建产物 =====
+dist/
+build/
+*.spec
+
 # ===== IDE =====
 .idea/
 .vscode/
