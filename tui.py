@@ -9,7 +9,9 @@ USTB chat2api TUI 控制台
   [5] 重新生成 API Key（立即生效，无需重启）
   [6] 重新检测服务与密钥
   [7] 发送测试对话
-  [q] 退出
+  [0] 检测登录状态
+  [h] 隐藏到托盘（服务转交托盘常驻，窗口关闭）
+  [q] 退出（停止服务）
 
 运行: python tui.py
 """
@@ -30,9 +32,9 @@ sys.path.insert(0, BASE_DIR)
 
 import chat2api
 from chat2api import load_config, CONFIG_FILE, PORT, MODEL_NAME, UPSTREAM
-from update_cookies import (cdp_alive, get_cookies_via_cdp, extract_needed,
-                            save_cookies, verify_cookies, launch_browser,
-                            NEEDED, DEBUG_PORT, CHAT_URL)
+from cli import (cdp_alive, get_cookies_via_cdp, extract_needed,
+                 save_cookies, verify_cookies, launch_browser,
+                 NEEDED, DEBUG_PORT, CHAT_URL)
 
 BASE_URL = f"http://127.0.0.1:{PORT}/v1"
 CHAT_ENDPOINT = f"{BASE_URL}/chat/completions"
@@ -75,7 +77,7 @@ def service_online():
 def start_server():
     def run():
         import uvicorn
-        uvicorn.run(chat2api.app, host="127.0.0.1", port=PORT, log_level="warning")
+        uvicorn.run(chat2api.app, host=chat2api.get_host(), port=PORT, log_level="warning")
     threading.Thread(target=run, daemon=True, name="uvicorn").start()
 
 
@@ -198,7 +200,7 @@ SESSION_TEXT = {"valid": "已登录（会话有效）", "expired": "会话已失
 def render(cfg):
     os.system("cls")
     key = cfg["api_key"]
-    s_dot, s_detail = dot(STATE["service"]), STATE["service_detail"]
+    s_detail = STATE["service_detail"]
     print(f"{BOLD}┌─ USTB chat2api 控制台 ──────────────────────────────────────┐{RESET}")
     print(f"│  服务状态: {dot(STATE['service'])} {'服务在线' if STATE['service'] in ('ok','bad_key') else '服务异常'}"
           f"    上游会话: {dot(STATE['session'])} {SESSION_TEXT.get(STATE['session'], '')}")
@@ -207,10 +209,12 @@ def render(cfg):
     print(f"│  端点: {CYAN}{CHAT_ENDPOINT}{RESET}")
     print(f"│  Base URL: {CYAN}{BASE_URL}{RESET}    模型: {CYAN}{MODEL_NAME}{RESET}")
     print(f"│  API Key: {CYAN}{key}{RESET}")
+    print(f"│  Dashboard: {CYAN}http://127.0.0.1:{PORT}/dashboard{RESET}")
     print(f"├─ 操作（单键） ──────────────────────────────────────────────┤")
     print(f"│  {BOLD}[1]{RESET} 复制端点   {BOLD}[2]{RESET} 复制 Base URL   {BOLD}[3]{RESET} 复制 API Key")
     print(f"│  {BOLD}[4]{RESET} 登录/更新 Cookie   {BOLD}[5]{RESET} 重新生成 Key")
-    print(f"│  {BOLD}[6]{RESET} 重新检测服务   {BOLD}[7]{RESET} 测试对话   {BOLD}[0]{RESET} 检测登录状态   {BOLD}[q]{RESET} 退出")
+    print(f"│  {BOLD}[6]{RESET} 重新检测服务   {BOLD}[7]{RESET} 测试对话   {BOLD}[0]{RESET} 检测登录状态")
+    print(f"│  {BOLD}[h]{RESET} 隐藏到托盘（服务常驻）   {BOLD}[q]{RESET} 退出（停止服务）")
     print(f"└─────────────────────────────────────────────────────────────┘")
     if STATE["msg"]:
         color = GREEN if "✓" in STATE["msg"] else (RED if ("失败" in STATE["msg"] or "无效" in STATE["msg"]) else YELLOW)

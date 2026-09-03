@@ -28,16 +28,56 @@ Chat2API/
 ├── start_tray.bat       # 启动托盘常驻模式（推荐，无窗口）
 ├── start_tui.bat        # 启动 TUI 控制台
 ├── chat2api.py          # 核心转发服务（FastAPI + 工具调用桥）
+├── dashboard.py         # 本地仪表盘（/dashboard 可视化 + /stats JSON）
 ├── tray.py              # 系统托盘常驻程序（含服务守护）
 ├── tui.py               # TUI 控制台
-├── update_cookies.py    # Cookie 提取/更新工具（可独立运行）
-├── manage_keys.py       # API Key 管理工具
+├── cli.py               # 命令行工具箱（cookie 提取 + key 管理，合并自旧脚本）
+├── update_cookies.py    # [弃用 shim] → python cli.py cookie
+├── manage_keys.py       # [弃用 shim] → python cli.py key
 ├── requirements.txt
 ├── config.example.json  # 配置模板（首次运行自动生成 config.json）
-├── tests/
-│   └── test_tools_unit.py   # 工具调用桥单元测试（28 项，确定性）
-└── .gitignore
+└── tests/
+    ├── test_tools_unit.py     # 工具调用桥单元测试（28 项，确定性）
+    ├── run_all.py             # 全链路回归（连通性/客户端payload/Agent循环）
+    └── test_context_length.py # 上游上下文长度探测
 ```
+
+## 本地 Dashboard
+
+服务运行时浏览器打开 **<http://127.0.0.1:8787/dashboard>**：
+
+- **吐词速度**（tok/s，含时间序列折线图）、**首字延迟**
+- **上下文用量**（最近请求 prompt tokens；usage 缺失时按 ~2.5 字符/token 估算并标注 est）
+- **累计 tokens（入/出）**、请求总数/错误数、上游会话状态、服务运行时长
+- 最近 12 条请求明细表
+
+JSON 接口：`GET /stats`（供脚本/外部监控轮询，会话状态有 60s 缓存）。
+
+## 上游上下文长度探测
+
+```bash
+python tests/test_context_length.py           # 标准探测: 4k→256k 字符台阶 + 二分细化
+python tests/test_context_length.py --quick   # 快速: 8k/32k/64k 三台阶
+```
+
+通过本代理直接测**上游真实容量**（非流式拿 usage.prompt_tokens 实测值），结果写
+`tests/context_len_result.txt`。实测 63k 字符（22k tokens）仍正常，256k 台阶请自行验证。
+
+> 注意：Trae"压缩上下文"时报 `destination-addr ... loopback NOT allowed (400)` 与上游上限**无关**
+> ——那是 Trae SOLO 云端沙箱在请求到达本服务之前就拦截了回环地址，详见下方"Trae 特调"章节。
+
+## 命令行工具箱（cli.py）
+
+```bash
+python cli.py cookie                # 自动提取 Cookie（拉起专用浏览器，登录后自动截取）
+python cli.py cookie manual "easy_session=..; cookie_vjuid_login=.."
+python cli.py cookie --port 9222    # 连接已开启调试端口的浏览器
+python cli.py key generate [名称]   # 生成新 API Key（明文仅显示一次，落盘为哈希）
+python cli.py key list              # 列出所有 Key（只显示前缀）
+python cli.py key revoke <前缀>     # 吊销
+```
+
+所有变更热加载，无需重启服务。（`update_cookies.py` / `manage_keys.py` 为兼容旧命令的弃用 shim，可删除）
 
 ## 环境要求
 
@@ -213,13 +253,7 @@ curl http://127.0.0.1:8787/v1/chat/completions ^
 
 ## API Key 管理
 
-```bash
-python manage_keys.py generate [名称]   # 生成随机 key（明文仅显示一次，落盘为哈希）
-python manage_keys.py list              # 列出所有 key（只显示前缀）
-python manage_keys.py revoke <前缀>     # 吊销
-```
-
-所有变更热加载，无需重启服务。
+见上方"命令行工具箱（cli.py）"的 `key` 子命令。
 
 ## 开机自启（可选）
 

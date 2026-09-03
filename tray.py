@@ -42,9 +42,9 @@ def log(msg: str):
 
 import chat2api
 from chat2api import load_config, CONFIG_FILE, PORT, MODEL_NAME
-from update_cookies import (cdp_alive, get_cookies_via_cdp, extract_needed,
-                            save_cookies, verify_cookies, launch_browser,
-                            NEEDED, DEBUG_PORT, CHAT_URL)
+from cli import (cdp_alive, get_cookies_via_cdp, extract_needed,
+                 save_cookies, verify_cookies, launch_browser,
+                 NEEDED, DEBUG_PORT, CHAT_URL)
 
 BASE_URL = f"http://127.0.0.1:{PORT}/v1"
 CHAT_ENDPOINT = f"{BASE_URL}/chat/completions"

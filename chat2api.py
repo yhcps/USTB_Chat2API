@@ -20,6 +20,9 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 
+import dashboard  # noqa: E402  (同目录模块: 本地仪表盘)
+from dashboard import record_request  # noqa: E402  (采集 /stats 数据)
+
 # ===== 配置 =====
 UPSTREAM = "http://chat.ustb.edu.cn"
 COMPOSE_ID = "3"          # DeepSeek 应用 id
@@ -347,6 +350,7 @@ def get_host() -> str:
 
 
 app = FastAPI(title="USTB DeepSeek chat2api")
+app.include_router(dashboard.router)  # /stats + /dashboard 本地仪表盘
 
 
 @app.exception_handler(Exception)
@@ -545,6 +549,9 @@ async def chat_completions(request: Request):
     want_usage = include_usage or not stream
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
 
+    prompt_chars = sum(len(content_to_text(m.get("content"))) for m in body.get("messages", []))
+    t0 = time.time()
+
     if not stream:
         content, reasoning, usage = "", "", None
         async for item in stream_upstream_chunks(fields, want_usage):
@@ -557,37 +564,65 @@ async def chat_completions(request: Request):
         text, calls = extract_tool_calls(content, known_tools)
         if calls:
             _log_tools(calls)
+        pt = usage.get("prompt_tokens") if usage else None
+        ct = usage.get("completion_tokens") if usage else None
+        if ct is None:
+            ct = int(len(text) / 2.5)  # usage 缺失时按字符估算
+        record_request(model, False, prompt_chars, pt, ct,
+                       time.time() - t0, None, 200)
         return JSONResponse(json.loads(make_final(cid, model, text, reasoning, usage, calls)))
 
     async def sse():
         parser = ToolCallStreamParser(known_tools)
+        first_tok = None     # 首 token 延迟 s
+        out_chars = 0        # 输出字符数（usage 缺失时估算用）
+        usage_pt = usage_ct = None
+        status = 200
         # 首块: role
         yield make_chunk(cid, model, {"role": "assistant", "content": ""})
+        held_finish = None
         try:
             async for item in stream_upstream_chunks(fields, want_usage):
                 if "usage" in item:
-                    yield make_chunk(cid, model, {}, finish=None, usage=item["usage"])
+                    u = item["usage"]
+                    usage_pt, usage_ct = u.get("prompt_tokens"), u.get("completion_tokens")
+                    yield make_chunk(cid, model, {}, finish=None, usage=u)
                 elif "choice" in item:
                     delta = item["choice"].get("delta", {}) or {}
                     finish = item["choice"].get("finish_reason")
                     text = delta.get("content") or ""
                     reasoning = delta.get("reasoning_content") or ""
+                    if (reasoning or text) and first_tok is None:
+                        first_tok = time.time() - t0
                     if reasoning:
                         yield make_chunk(cid, model, {"reasoning_content": reasoning})
                     if text:
+                        out_chars += len(text)
                         out_c, out_t = parser.feed(text)
                         if out_c:
                             yield make_chunk(cid, model, {"content": out_c})
                         for ev in out_t:
                             yield make_chunk(cid, model, {"tool_calls": [ev]})
                     if finish:
-                        yield make_chunk(cid, model, {},
-                                         finish="tool_calls" if parser.found else finish)
-            left = parser.flush()
+                        held_finish = finish  # 最后再发，保证 flush 事件先于结束帧
+            left, left_ev = parser.flush()
+            for ev in left_ev:
+                yield make_chunk(cid, model, {"tool_calls": [ev]})
             if left:
+                out_chars += len(left)
                 yield make_chunk(cid, model, {"content": left})
+            if held_finish or parser.found:
+                yield make_chunk(cid, model, {},
+                                 finish="tool_calls" if parser.found else held_finish)
+            if parser.events:
+                _log_tools(parser.events)
         except HTTPException as e:
+            status = 502
             yield f"data: {json.dumps({'error': {'message': e.detail, 'type': 'upstream_error'}})}\n\n"
+        finally:
+            ct = usage_ct if usage_ct is not None else int(out_chars / 2.5)
+            record_request(model, True, prompt_chars, usage_pt, ct,
+                           time.time() - t0, first_tok, status)
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(sse(), media_type="text/event-stream",
