@@ -124,6 +124,12 @@ _INVOKE_OPEN_RE = re.compile(r'<invoke\b', re.I)
 _CLOSER_RES = {"tc": re.compile(r'</tool_calls\s*>', re.I),
                "single": re.compile(r'</tool_call\s*>', re.I),
                "inv": re.compile(r'</invoke\s*>', re.I)}
+# 宽容闭合兜底：模型偶发把 </tool_calls> 笔误写成 </calls>/</call>/</tool_call> 等
+# （实测泄露案例）。仅在精确闭合未命中时启用，且必须已有对应开块，误伤面极小。
+_FUZZY_CLOSE_RE = re.compile(r'</(?:tool_?)?calls?\s*>', re.I)
+_FUZZY_TAIL_RE = re.compile(r'</(?:tool_?)?calls?\s*>\s*$', re.I)  # 流末（flush）用
+# 裸标签参数兜底：模型偶发不按 <parameter name=".."> 规范，改写 <file_path>值</file_path>
+_RAW_PARAM_RE = re.compile(r'<(\w+)(?:\s[^>]*)?>([^<]*)</\1>', re.I)
 _CLOSER_KEEP = 12  # 最长闭合标签 '</tool_calls>' 长度-1，流式扣住尾部防 closer 被分片拆开漏检
 
 

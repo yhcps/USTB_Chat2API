@@ -20,26 +20,28 @@
 - **凭证自动化**：登录状态自动检测；未登录自动拉起浏览器完成 SSO 后自动截取 Cookie 存储
 - **API Key 管理**：初始化生成默认 Key，支持热重载（增删改无需重启）
 
+> **注意**：本服务主要针对 **Trae IDE** 进行了 Agent 模式特调。其他客户端（如 CherryStudio、ChatBox、NextChat 等）可能因对 `tool_calls` 的处理方式不同，出现兼容性问题。详见下方 [兼容性说明](#兼容性说明)。
+
 ## 项目结构
 
 ```
 Chat2API/
-├── install.bat          # 一键安装（创建 venv + 装依赖）
-├── start_tray.bat       # 启动托盘常驻模式（推荐，无窗口）
-├── start_tui.bat        # 启动 TUI 控制台
-├── chat2api.py          # 核心转发服务（FastAPI + 工具调用桥）
-├── dashboard.py         # 本地仪表盘（/dashboard 可视化 + /stats JSON）
-├── tray.py              # 系统托盘常驻程序（含服务守护）
-├── tui.py               # TUI 控制台
-├── cli.py               # 命令行工具箱（cookie 提取 + key 管理，合并自旧脚本）
-├── update_cookies.py    # [弃用 shim] → python cli.py cookie
-├── manage_keys.py       # [弃用 shim] → python cli.py key
+├── install.bat              # 一键安装（创建 venv + 装依赖）
+├── start_tray.bat           # 启动托盘常驻模式（推荐，无窗口）
+├── start_tui.bat            # 启动 TUI 控制台
+├── chat2api.py              # 核心转发服务（FastAPI + 工具调用桥）
+├── dashboard.py             # 本地仪表盘（/dashboard 可视化 + /stats JSON）
+├── tray.py                  # 系统托盘常驻程序（含服务守护）
+├── tui.py                   # TUI 控制台
+├── cli.py                   # 命令行工具箱（cookie 提取 + key 管理）
 ├── requirements.txt
-├── config.example.json  # 配置模板（首次运行自动生成 config.json）
+├── config.json              # 运行时配置（自动生成，勿提交）
+├── config.example.json      # 配置模板
 └── tests/
-    ├── test_tools_unit.py     # 工具调用桥单元测试（28 项，确定性）
-    ├── run_all.py             # 全链路回归（连通性/客户端payload/Agent循环）
-    └── test_context_length.py # 上游上下文长度探测
+    ├── test_tools_unit.py   # 工具调用桥单元测试（49 项，确定性）
+    ├── test_stream_leak.py  # 真实请求流式泄露回归（6 用例并发）
+    ├── test_context_length.py # 上游上下文长度探测
+    └── test_output_length.py  # 上游输出窗口探测
 ```
 
 ## 本地 Dashboard
@@ -77,7 +79,48 @@ python cli.py key list              # 列出所有 Key（只显示前缀）
 python cli.py key revoke <前缀>     # 吊销
 ```
 
-所有变更热加载，无需重启服务。（`update_cookies.py` / `manage_keys.py` 为兼容旧命令的弃用 shim，可删除）
+所有变更热加载，无需重启服务。
+
+## 配置说明
+
+### config.json —— 运行时配置（自动生成，勿提交）
+
+首次启动自动创建，手动维护可参照 `config.example.json`。Cookie 与 Key 均**逐请求热加载**，修改后无需重启：
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `host` | `127.0.0.1` | 监听地址。仅本机使用保持默认；Trae SOLO 等云端沙箱场景需改为 `0.0.0.0` 并用局域网 IP 访问（见下方"已知边界"章节，务必同步更换强 Key） |
+| `api_key` | `sk-local` | 内置简单 Key（明文保存）。与 `api_keys.json` 的多 Key 并行有效，任一匹配即通过鉴权 |
+| `cookies.easy_session` | 空 | 校内平台会话 Cookie，由托盘 / `cli.py cookie` 自动截取写入，一般无需手改 |
+| `cookies.cookie_vjuid_login` | 空 | 同上 |
+
+> 手动更新 Cookie 请用 `python cli.py cookie manual "easy_session=..; cookie_vjuid_login=.."`，避免直接编辑 JSON 时转义出错。
+
+### api_keys.json —— 多 Key 存储（自动生成，勿提交）
+
+`cli.py key generate / list / revoke` 的存储文件：Key 以 **SHA-256 哈希**落盘（明文仅在生成时显示一次），支持 `disabled` 停用标记；与 `config.json` 的 `api_key` 并行生效，同样热重载。
+
+### chat2api.py 内置常量（进阶）
+
+以下常量写在 `chat2api.py` 头部，修改后**必须重启服务**（无自动重载）：
+
+| 常量 | 默认值 | 说明 |
+|---|---|---|
+| `PORT` | `8787` | 服务端口（被占用时的改法见"常见问题排查"） |
+| `UPSTREAM` | `http://chat.ustb.edu.cn` | 上游地址 |
+| `COMPOSE_ID` | `3` | 上游 DeepSeek 应用 id |
+| `MODEL_NAME` | `DeepSeek` | 上游模型名；对外别名见 `/v1/models`（`deepseek-r1` / `deepseek-chat` / `deepseek-reasoner`） |
+
+## 推荐上下文窗口
+
+本服务作为网关，建议客户端按以下安全窗口使用：
+
+| 参数 | 推荐值 | 说明 |
+|---|---|---|
+| 输入上下文 | **65536 tokens** | 安全上限（实测约 72883 prompt_tokens 仍正常，再大可能触发上游 502） |
+| 输出窗口 | **32768 tokens** | 安全上限（实测约 61725 tokens，但大幅输出耗时较长，建议客户端限制输出量） |
+
+> 实测值见下方 [上游能力测试结果](#上游能力测试结果) 章节。超出推荐值可能触发上游 `502 history参数异常` 或超时。
 
 ## 环境要求
 
@@ -174,6 +217,20 @@ curl http://127.0.0.1:8787/v1/chat/completions ^
 1. 设置 → 模型 → 添加自定义模型：按上表填写
 2. 选中该模型，切到 **Agent** 模式
 3. 正常对话即可——工具调用由本服务自动桥接，模型执行文件读写、搜索、命令等操作与官方模型一致
+
+## 兼容性说明
+
+> **本服务的工具调用桥针对 Trae IDE 的 Agent 模式做了特调与全量实测**（24 个工具稳定循环、流式转换零泄漏）。普通对话在任意 OpenAI 兼容客户端均可用；**Agent / 工具调用场景在其他客户端（CherryStudio / ChatBox / NextChat / 自研程序等）可能出现兼容性问题**，常见现象与解决思路如下：
+
+| 现象 | 原因 | 解决思路 |
+|---|---|---|
+| 回复中原样输出 `<tool_calls>` / `<invoke ...>` 等 XML 原文（**尖括号直出**），Agent 不执行工具直接停摆 | 上游不支持 function calling，工具调用全靠桥接层把模型输出的 XML 实时转成标准 `tool_calls`。若客户端未下发 `tools`（桥接未启用）、或请求打到了旧版服务（无桥接/未重启），XML 会以正文形式直出 | ① 确认客户端 Agent 模式确实下发了 `tools`；② 升级本服务并重启（对照进程启动时间与文件修改时间，服务无自动重载）；③ 查看 `server_debug.log` 确认该请求的 tools 注入与转换记录 |
+| 工具执行后 Agent 循环中断，报 `最后一条消息必须是 user` 或 `history参数异常 (4028)` | `role:"tool"` 消息未经桥接转换直传上游（上游协议无此角色） | 由本服务自动转换（`tool`→user 文本回传）；若客户端自拼请求体，保持 user/assistant 严格交替，勿手动携带 `tool` 角色 |
+| 客户端对 `tool_calls` 增量事件解析不完整，只显示部分参数 | 部分客户端仅支持非流式 `tool_calls`，或按位置而非 `index` 聚合 delta | 升级客户端；自研程序请按 OpenAI 流式规范用 `index` 聚合 `tool_calls` delta |
+| 不显示思考过程 | `reasoning_content` 是 DeepSeek 系扩展字段 | 忽略即可，正文在 `content` 正常输出；需要思考流的客户端按 DeepSeek/OpenAI 兼容扩展解析 |
+| 长上下文请求报 502 或超时 | 超出上游实际容量 | 按上文[推荐上下文窗口](#推荐上下文窗口)限制：输入 65536 / 输出 32768 tokens |
+
+**为其他客户端做适配的开发者**请继续阅读下方「Trae 针对性特调」章节，完整记录了桥接设计与集成要点。
 
 ## Trae 针对性特调：`<>` 直出问题的完整解析
 
