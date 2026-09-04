@@ -11,9 +11,9 @@ USTB chat2api 系统托盘常驻程序
       python tray.py    （控制台自动隐藏）
 退出: 托盘图标右键 -> 退出
 """
-import ctypes
 import json
 import os
+import platform
 import secrets
 import string
 import subprocess
@@ -26,7 +26,8 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 import pystray
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+IS_WINDOWS = platform.system() == "Windows"
+BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 sys.path.insert(0, BASE_DIR)
 
 LOG_FILE = os.path.join(BASE_DIR, "tray.log")
@@ -87,6 +88,28 @@ def start_server_if_needed():
             time.sleep(0.3)
         return False
     return True
+
+
+def _exec_self_tray():
+    """托盘整进程自我替换：同进程重启 uvicorn 不会重载 chat2api 模块，必须换新进程"""
+    if getattr(sys, "frozen", False):
+        os.execv(sys.executable, [sys.executable] + sys.argv[1:])
+    else:
+        os.execv(sys.executable, [sys.executable, os.path.join(BASE_DIR, "tray.py")])
+
+
+def _api_restart_callback():
+    """供 /restart 端点调用：先让 HTTP 应答送达，再整进程重启"""
+    log("API /restart 触发整进程重启")
+    time.sleep(0.5)
+    _exec_self_tray()
+
+
+def on_restart(icon, _):
+    """托盘菜单「重启服务」：托盘 + 服务一起换新进程，加载最新代码/配置"""
+    log("托盘菜单触发整进程重启")
+    notify(icon, "正在重启服务...")
+    _exec_self_tray()
 
 
 # ---------- 状态检测 ----------
@@ -168,8 +191,23 @@ def refresh_icon(icon):
 
 def copy_to_clipboard(text) -> bool:
     try:
-        p = subprocess.Popen(["clip"], stdin=subprocess.PIPE, shell=True)
-        p.communicate(text.encode("gbk", "replace"))
+        if IS_WINDOWS:
+            p = subprocess.Popen(["clip"], stdin=subprocess.PIPE, shell=True)
+            p.communicate(text.encode("gbk", "replace"))
+        elif sys.platform == "darwin":
+            p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+            p.communicate(text.encode("utf-8"))
+        else:  # Linux X11/Wayland
+            for cmd in (["xclip", "-selection", "clipboard"], ["wl-copy"]):
+                try:
+                    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                    p.communicate(text.encode("utf-8"))
+                    if p.returncode == 0:
+                        break
+                except FileNotFoundError:
+                    continue
+            else:
+                return False
         return True
     except Exception:
         return False
@@ -249,8 +287,12 @@ def on_open_tui(icon, _):
     if time.time() - _last_tui < 2:
         return
     _last_tui = time.time()
-    python_exe = sys.executable.replace("pythonw.exe", "python.exe")
-    subprocess.Popen([python_exe, os.path.join(BASE_DIR, "tui.py")],
+    if getattr(sys, "frozen", False):  # 单 EXE: 无参数启动即托盘，带 tui 参数开控制台
+        target = [sys.executable, "tui"]
+    else:
+        python_exe = sys.executable.replace("pythonw.exe", "python.exe")
+        target = [python_exe, os.path.join(BASE_DIR, "tui.py")]
+    subprocess.Popen(target,
                      cwd=BASE_DIR, creationflags=subprocess.CREATE_NEW_CONSOLE)
 
 
@@ -280,21 +322,74 @@ def auto_refresh(icon):
             pass
 
 
+def _lock_file_path():
+    return os.path.join(BASE_DIR, ".tray.lock")
+
+
+def _try_acquire_lock() -> bool:
+    """跨平台单实例锁：Windows 用 Mutex，Linux 用文件锁 + PID 校验"""
+    if IS_WINDOWS:
+        import ctypes
+        mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "chat2api_tray_mutex")
+        if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            log("已有托盘实例在运行，本次启动退出")
+            return False
+        return True
+    else:
+        lock_path = _lock_file_path()
+        try:
+            if os.path.exists(lock_path):
+                with open(lock_path, "r") as f:
+                    old_pid = int(f.read().strip())
+                try:
+                    os.kill(old_pid, 0)  # 进程存活检测
+                    log(f"已有托盘实例在运行 (PID {old_pid})，本次启动退出")
+                    return False
+                except (OSError, ProcessLookupError):
+                    log(f"旧托盘实例 (PID {old_pid}) 已不在，继续启动")
+            import fcntl
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except IOError:
+                os.close(fd)
+                log("已有托盘实例在运行（文件锁占用），本次启动退出")
+                return False
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return True
+        except Exception as e:
+            log(f"单实例锁检测异常: {e}")
+            return True  # 锁异常时允许启动，避免误杀
+
+
+def _cleanup_lock():
+    if IS_WINDOWS:
+        return
+    lock_path = _lock_file_path()
+    try:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+    except Exception:
+        pass
+
+
 def main():
-    # 单实例保护: 已有托盘常驻进程时本次启动直接退出
-    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "chat2api_tray_mutex")
-    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        log("已有托盘实例在运行，本次启动退出")
+    # 跨平台单实例保护
+    if not _try_acquire_lock():
         return
 
-    # 隐藏控制台窗口（以 python.exe 启动时）
-    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-    if hwnd:
-        ctypes.windll.user32.ShowWindow(hwnd, 0)
+    # 隐藏控制台窗口（仅 Windows 以 python.exe 启动时）
+    if IS_WINDOWS:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
 
     try:
         if not start_server_if_needed():
             log(f"服务启动失败，端口 {PORT} 未能监听")
+        chat2api.RESTART_CALLBACK = _api_restart_callback  # /restart 端点 -> 整进程重启
         menu = pystray.Menu(
             pystray.MenuItem(status_text, None, enabled=False),
             pystray.Menu.SEPARATOR,
@@ -307,6 +402,7 @@ def main():
             pystray.MenuItem("巡检服务与会话", on_check),
             pystray.MenuItem("测试对话", on_test_chat),
             pystray.MenuItem("登录 / 更新 Cookie", on_login),
+            pystray.MenuItem("重启服务", on_restart),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出", on_quit),
         )
@@ -316,6 +412,8 @@ def main():
         icon.run()
     except Exception:
         log("托盘主循环异常:\n" + traceback.format_exc())
+    finally:
+        _cleanup_lock()
 
 
 if __name__ == "__main__":

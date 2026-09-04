@@ -347,5 +347,88 @@ check("final无裸尖括号", "<" not in fin and "\\u003c" in fin)
 back = json.loads(fin)["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
 check("final解析还原", json.loads(back)["code"] == "<tool_calls>x</tool_calls>")
 
+print("== H41 DSML 腐蚀标签（｜DSML｜ 变体 / </tocalls>，真实泄露治理）==")
+
+# 案例1（真实泄露现场）：包裹闭合被腐蚀成 </｜DSML｜>，旧版 flush 整块原文外露、调用不执行
+dsml1 = ('<tool_calls><invoke name="SearchReplace"><parameter name="file_path">f:\\x.py</parameter>'
+         '</invoke></｜DSML｜>后续正文')
+clean, tcs = c.extract_tool_calls(dsml1, ["SearchReplace"])
+check("非流式DSML包裹闭合", clean == "后续正文" and len(tcs) == 1
+      and json.loads(tcs[0]["function"]["arguments"]).get("file_path") == "f:\\x.py")
+txt, evs = _stream_split([dsml1], names=("SearchReplace",))
+check("流式DSML包裹闭合", txt == "后续正文" and len(evs) == 1
+      and json.loads(evs[0]["function"]["arguments"]).get("file_path") == "f:\\x.py")
+
+# 案例2（真实泄露现场）：参数闭合被腐蚀且无真闭合（</｜DSML｜> 替 </parameter>）
+dsml2 = ('<tool_calls><invoke name="Write"><parameter name="file_path">f:\\a.py</parameter>'
+         '<parameter name="content">print(1)</｜DSML｜></｜DSML｜>')
+clean, tcs = c.extract_tool_calls(dsml2, ["Write"])
+args = json.loads(tcs[0]["function"]["arguments"]) if tcs else {}
+check("非流式DSML参数闭合", clean == "" and len(tcs) == 1
+      and args.get("file_path") == "f:\\a.py" and args.get("content") == "print(1)")
+txt, evs = _stream_split([dsml2], names=("Write",))
+args = json.loads(evs[0]["function"]["arguments"]) if evs else {}
+check("流式DSML参数闭合(容错提取)", txt == "" and len(evs) == 1
+      and args.get("file_path") == "f:\\a.py" and args.get("content") == "print(1)")
+
+# 案例3：</tocalls> 替 </tool_calls>
+toc = ('<tool_calls><invoke name="Read"><parameter name="file_path">f:\\b.py</parameter>'
+       '</invoke></tocalls>尾部')
+txt, evs = _stream_split([toc], names=("Read",))
+check("流式tocalls闭合", txt == "尾部" and len(evs) == 1
+      and json.loads(evs[0]["function"]["arguments"]).get("file_path") == "f:\\b.py")
+
+# 案例4（tui.py 真实案例）：参数开标签被腐蚀 <｜DSML｜ name="file_path" ...> 替 <parameter ...>
+dsml4 = ('<tool_calls><invoke name="SearchReplace">'
+         '<｜DSML｜ name="file_path" string="true">f:\\tui.py</parameter>'
+         '<parameter name="old_str">def main():</parameter></invoke></tool_calls>')
+clean, tcs = c.extract_tool_calls(dsml4, ["SearchReplace"])
+args = json.loads(tcs[0]["function"]["arguments"]) if tcs else {}
+check("非流式DSML参数开标签", len(tcs) == 1
+      and args.get("file_path") == "f:\\tui.py" and args.get("old_str") == "def main():")
+
+# 案例5：孤立腐蚀标签（<｜DSML｜e>）在正文/思考区剥离，不外露
+txt, evs = _stream_split(["回答前<｜DSML｜e>回答后"], names=("Read",))
+check("孤立DSML标签剥离(正文)", txt == "回答前回答后" and not evs)
+o, fl = feed_all(["思考<｜DSML｜e>继续思考"])
+check("孤立DSML标签剥离(思考区)", o + fl == "思考继续思考")
+o, fl = feed_all(["思考<tool_calls><invoke name=\"R\"></invoke></｜DSML｜>后续思考"])
+check("reasoning DSML闭合", o + fl == "思考后续思考")
+
+# 穷举切分（两片全量）：任意分片边界下腐蚀闭合不泄露、调用不丢失
+h41 = ('前文<tool_calls><invoke name="Write"><parameter name="file_path">f:\\h.py</parameter>'
+       '</invoke></｜DSML｜>后文')
+h41bad = []
+for i in range(len(h41) + 1):
+    txt, evs = _stream_split([h41[:i], h41[i:]], names=("Write",))
+    if txt != "前文后文" or len(evs) != 1:
+        h41bad.append(i)
+    elif json.loads(evs[0]["function"]["arguments"]).get("file_path") != "f:\\h.py":
+        h41bad.append(("args", i))
+check("H41 content两片穷举切分" + (f"，异常位:{h41bad[:6]}" if h41bad else "全部无损"), not h41bad)
+
+r41 = '先想。<tool_calls><invoke name="R"></invoke></｜DSML｜>再想。'
+r41bad = []
+for i in range(len(r41) + 1):
+    o, fl = feed_all([r41[:i], r41[i:]])
+    if o + fl != "先想。再想。":
+        r41bad.append(i)
+check("H41 reasoning两片穷举切分" + (f"，异常位:{r41bad[:6]}" if r41bad else "全部无损"), not r41bad)
+
+print("== 尖括号预警（调试阶段）==")
+
+st = {}
+c.angle_bracket_check("这是一段正常的回答，包含 a < b 的比较与 `code` 片段。" * 10, "content", st)
+check("预警-正常文本不触发", "warned" not in st)
+
+st = {}
+c.angle_bracket_check("前文很短", "content", st)
+c.angle_bracket_check("<tool_calls><invoke name=\"Read\">", "content", st)
+check("预警-泄露模式立即触发", st.get("warned") is True and st.get("cnt", 0) > 0)
+
+st = {"cnt": 150, "chars": 800}
+c.angle_bracket_check("<" * 60, "reasoning", st)
+check("预警-累计总量触发", st.get("warned") is True)
+
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

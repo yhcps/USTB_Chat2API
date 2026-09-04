@@ -14,6 +14,8 @@ import asyncio
 import re
 import hashlib
 import os
+import sys
+import threading
 import traceback
 from datetime import datetime
 import httpx
@@ -21,7 +23,7 @@ from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from .utils import (load_config, get_host, log_error, log_tools, content_to_text,
-                    verify_key, DEBUG_LOG)
+                    verify_key, DEBUG_LOG, angle_bracket_check)
 from . import dashboard  # noqa: E402
 from .dashboard import record_request  # noqa: E402  (采集 /stats 数据)
 
@@ -101,34 +103,69 @@ _FENCE_HEAD_RE = re.compile(r'^\s*(```xml|```)[ \t]*\n?', re.I)
 _TC_OPEN_RE = re.compile(r'<tool_calls\s*>', re.I)
 _TCC_OPEN_RE = re.compile(r'<tool_call\s*>', re.I)
 _INVOKE_OPEN_RE = re.compile(r'<invoke\b', re.I)
-_CLOSER_RES = {"tc": re.compile(r'</tool_calls\s*>', re.I),
-               "single": re.compile(r'</tool_call\s*>', re.I),
-               "inv": re.compile(r'</invoke\s*>', re.I)}
+_CLOSER_RES = {"tc": re.compile(r'</(?:tool_calls|tocalls|｜DSML｜)[^>]*>', re.I),
+               "single": re.compile(r'</(?:tool_call|tool_calls|tocalls|｜DSML｜)[^>]*>', re.I),
+               "inv": re.compile(r'</(?:invoke|｜DSML｜)[^>]*>', re.I)}
 # 宽容闭合兜底：模型偶发把 </tool_calls> 笔误写成 </calls>/</call>/</tool_call> 等
 # （实测泄露案例）。仅在精确闭合未命中时启用，且必须已有对应开块，误伤面极小。
 _FUZZY_CLOSE_RE = re.compile(r'</(?:tool_?)?calls?\s*>', re.I)
 _FUZZY_TAIL_RE = re.compile(r'</(?:tool_?)?calls?\s*>\s*$', re.I)  # 流末（flush）用
 # 裸标签参数兜底：模型偶发不按 <parameter name=".."> 规范，改写 <file_path>值</file_path>
 _RAW_PARAM_RE = re.compile(r'<(\w+)(?:\s[^>]*)?>([^<]*)</\1>', re.I)
-_CLOSER_KEEP = 12  # 最长闭合标签 '</tool_calls>' 长度-1，流式扣住尾部防 closer 被分片拆开漏检
+# H41 DSML 腐蚀兜底（实测泄露案例）：上游偶发把结构标签腐蚀成 ｜DSML｜ 变体（DeepSeek
+# 内部标记泄漏）：</｜DSML｜>/</｜DSML｜e> 可替 </tool_calls>/</invoke>/</parameter>，
+# <｜DSML｜ ...> 可替 <parameter ...>，</tocalls> 替 </tool_calls>。
+# ｜DSML｜ 只可能是上游噪声、不可能是合法内容，一律按「闭合最内层结构」消化。
+_DSML_CLOSE_RE = re.compile(r'</｜DSML｜[^>]*>', re.I)
+_DSML_ANY_RE = re.compile(r'</?｜DSML｜[^>]*>', re.I)
+_DSML_OPEN_PARAM_RE = re.compile(r'<｜DSML｜\s([^>]*=[^>]*)>', re.I)
+_CLOSER_KEEP = 24  # 流式扣住尾部窗口防 closer 被分片拆开漏检（DSML 腐蚀变体较长，留余量）
 
 
-# 结构标签分词：配对计算用（H40 嵌套污染——参数值内的同名标签是字面文本，不参与配对）
-_TAG_TOK_RE = re.compile(r'<(/?)(parameter|invoke|tool_calls|tool_call)\b[^>]*>', re.I)
-_PARAM_TOK_RE = re.compile(r'<(/?)parameter\b[^>]*>', re.I)
+# 结构标签分词：配对计算用（H40 嵌套污染——参数值内的同名标签是字面文本，不参与配对）；
+# 末两个分支为 H41 DSML 腐蚀变体
+_TAG_TOK_RE = re.compile(
+    r'<(/?)(parameter|invoke|tool_calls|tool_call)(?=[\s/>])[^>]*>'
+    r'|</｜DSML｜[^>]*>'
+    r'|<｜DSML｜(?=[\s/e])[^>]*>', re.I)
+_PARAM_TOK_RE = re.compile(r'<(/?)parameter\b[^>]*>|</｜DSML｜[^>]*>', re.I)
 _INVOKE_OPEN_FULL_RE = re.compile(r'<invoke\b[^>]*>', re.I)
 _WRAPPER_OPEN_RE = re.compile(r'<(tool_calls|tool_call)\s*>', re.I)
 
 
+def _tok_kind(t):
+    """标签 token -> (closing, tag名)。H41: DSML 腐蚀变体统一记作 'dsml'"""
+    if t.group(2) is not None:
+        return bool(t.group(1)), t.group(2).lower()
+    return t.group(0)[:2] == "</", "dsml"
+
+
 def _param_depth(head: str) -> int:
     """head 扫描到末尾时是否仍处于未闭合的 <parameter> 值内（>0 = 在值内）。
-    用于流式闭合判定：值内的闭合标签属字面文本，不能当作真闭合（H40 教训）。"""
+    用于流式闭合判定：值内的闭合标签属字面文本，不能当作真闭合（H40 教训）；
+    H41: DSML 腐蚀闭合只可能是上游噪声，按 </parameter> 消化，永不当作字面文本。"""
     d = 0
     for m in _PARAM_TOK_RE.finditer(head):
-        d += -1 if m.group(1) else 1
+        closing = m.group(0).startswith("</")
+        d += -1 if closing else 1
         if d < 0:
             d = 0  # 值内孤立的字面 </parameter> 不产生负深度
     return d
+
+
+def _unclosed_invoke(xml: str) -> bool:
+    """xml 内是否存在未闭合的 <invoke（按 parameter 深度配对，H40 兼容）。
+    流式 DSML 腐蚀闭合判向用：此时它替的是 </invoke> 而非包裹闭合。"""
+    inv_d = par_d = 0
+    for t in _TAG_TOK_RE.finditer(xml):
+        closing, tag = _tok_kind(t)
+        if tag == "parameter" or (tag == "dsml" and closing and par_d):
+            par_d += -1 if closing else 1
+            par_d = max(par_d, 0)
+        elif not par_d and (tag == "invoke" or (tag == "dsml" and closing)):
+            inv_d += -1 if closing else 1
+            inv_d = max(inv_d, 0)
+    return inv_d > 0
 
 
 def _parse_params(body: str) -> dict:
@@ -143,7 +180,7 @@ def _parse_params(body: str) -> dict:
         nm = re.search(r'name\s*=\s*["\']?([^"\'<>\s=]+)', om.group(1))
         depth, vend, first_close = 1, -1, -1
         for m in _PARAM_TOK_RE.finditer(body, om.end()):
-            if m.group(1):
+            if m.group(0).startswith("</"):  # H41: DSML 腐蚀闭合也算参数真闭合
                 if first_close == -1:
                     first_close = m.start()
                 depth -= 1
@@ -158,6 +195,21 @@ def _parse_params(body: str) -> dict:
             break
         params[nm.group(1).strip()] = body[om.end():vend]
         pos = vend
+    # H41 兜底：<｜DSML｜ ...> 替 <parameter name="..">（实测泄露案例，如
+    # <｜DSML｜ name="file_path" string="true">f:\xx</parameter>）。
+    # 名字取 name 属性；无 name 属性时取首个属性名。值到下一个闭合 token 为止。
+    pos = 0
+    while True:
+        dm = _DSML_OPEN_PARAM_RE.search(body, pos)
+        if not dm:
+            break
+        nm = (re.search(r'name\s*=\s*["\']?([^"\'<>\s=]+)', dm.group(1), re.I)
+              or re.search(r'(\w+)\s*=', dm.group(1)))
+        em = _PARAM_TOK_RE.search(body, dm.end())
+        if not (nm and em):
+            break
+        params[nm.group(1).strip()] = body[dm.end():em.start()]
+        pos = em.start()
     return params
 
 
@@ -172,17 +224,18 @@ def _iter_invoke_spans(xml: str):
             return
         par_d, closed = 0, False
         for t in _TAG_TOK_RE.finditer(xml, m.end()):
-            closing, tag = bool(t.group(1)), t.group(2).lower()
-            if tag == "parameter":
+            closing, tag = _tok_kind(t)
+            if tag == "parameter" or (tag == "dsml" and closing and par_d):
+                # H41: DSML 腐蚀闭合＝参数真闭合（上游噪声，不可能是字面文本）
                 par_d += -1 if closing else 1
                 if par_d < 0:
                     par_d = 0
-            elif closing and tag == "invoke" and par_d == 0:
+            elif closing and tag in ("invoke", "dsml") and par_d == 0:
                 yield m, xml[m.end():t.start()], t.end()
                 closed = True
                 break
         if not closed:
-            fm = re.search(r'</invoke\s*>', xml[m.end():], re.I)
+            fm = re.search(r'</(?:invoke|｜DSML｜)[^>]*>', xml[m.end():], re.I)
             if fm:
                 yield m, xml[m.end():m.end() + fm.start()], m.end() + fm.end()
             pos = m.end()
@@ -202,28 +255,39 @@ def _iter_wrapper_spans(text: str):
         kind = m.group(1).lower()
         inv_d = par_d = 0
         end = -1
+        consumed = False
+        last_end = m.end()  # 状态机最后消费到的位置（兜底搜索起点，防止重复匹配已消费 token）
         for t in _TAG_TOK_RE.finditer(text, m.end()):
-            closing, tag = bool(t.group(1)), t.group(2).lower()
-            if tag == "parameter":
+            consumed = True
+            last_end = t.end()
+            closing, tag = _tok_kind(t)
+            if tag == "parameter" or (tag == "dsml" and closing and par_d):
+                # H41: DSML 腐蚀闭合＝参数真闭合（上游噪声，不可能是字面文本）
                 par_d += -1 if closing else 1
                 if par_d < 0:
                     par_d = 0
             elif par_d:
                 continue  # 参数值内的一切标签均为字面文本
-            elif tag == "invoke":
+            elif tag == "invoke" or (tag == "dsml" and closing and inv_d):
                 inv_d += -1 if closing else 1
                 if inv_d < 0:
                     inv_d = 0
-            elif closing and tag == kind and inv_d == 0:
+            elif closing and (tag == kind or tag == "dsml") and inv_d == 0:
                 end = t.end()
                 break
         if end != -1:
             yield m.start(), m.end(), t.start(), end
             pos = end
+        elif consumed and inv_d == 0 and par_d == 0:
+            # H41: 状态机消化完且深度归零但无包裹闭合（腐蚀把多层闭合并进末尾 token），
+            # 块视为在 last_end 结束——开标签不得残留在正文里
+            yield m.start(), m.end(), last_end, last_end
+            pos = last_end
         else:
-            fm = re.search(rf'</{kind}\s*>', text[m.end():], re.I)
+            # 兜底从 last_end 起搜：块内已被状态机消化的 DSML/闭合不得再命中（H41 教训）
+            fm = re.search(rf'</(?:{kind}|tocalls|｜DSML｜)[^>]*>', text[last_end:], re.I)
             if fm:
-                yield m.start(), m.end(), m.end() + fm.start(), m.end() + fm.end()
+                yield m.start(), m.end(), last_end + fm.start(), last_end + fm.end()
             pos = m.end()
 
 
@@ -304,8 +368,10 @@ class ReasoningXMLFilter:
     # 会把半截前缀误当完整开标签消费掉（'s>' 成孤儿、闭合永不匹配、后续思考被整段吞掉）。
     # 必须要求标签名后紧跟 >/空白// 才算开标签，其余情况交给 _hold 扣住等下一分片。
     OPEN_RE = re.compile(r'<(tool_calls|tool_call(?!s)|invoke)(?=[\s>/])', re.I)
-    _OPEN_CAND = ("<tool_calls", "<tool_call", "<invoke")      # 跨分片拆开的开始标签前缀
-    _CLOSE_CAND = ("</tool_calls", "</tool_call", "</invoke")  # 跨分片拆开的结束标签前缀
+    _OPEN_CAND = ("<tool_calls", "<tool_call", "<invoke",
+                  "<｜dsml｜", "</｜dsml｜")                   # H41 腐蚀标签前缀（开/闭都扣）
+    _CLOSE_CAND = ("</tool_calls", "</tool_call", "</invoke",
+                   "</tocalls", "</｜dsml｜")                  # H41 腐蚀闭标签前缀
 
     def __init__(self):
         self.pending = ""     # 尾部疑似被拆分的标签前缀，扣住等下一分片
@@ -331,8 +397,9 @@ class ReasoningXMLFilter:
         while True:
             if self.suppress:
                 # 只匹配与开块对应的闭合标签：外层 tool_calls 内的 </invoke>
-                # 不能提前结束抑制（否则外层 </tool_calls> 会泄露为正文）
-                m = re.search(rf'</{self.tag}\s*>', buf, re.I)
+                # 不能提前结束抑制（否则外层 </tool_calls> 会泄露为正文）。
+                # H41: DSML 腐蚀闭合与 </tocalls> 同样结束抑制（上游噪声，不可能是内容）
+                m = re.search(rf'</(?:{self.tag}|tocalls)\s*>|</｜DSML｜[^>]*>', buf, re.I)
                 if m:  # XML 块结束，恢复输出（块内内容已丢弃）
                     buf = buf[m.end():]
                     self.suppress = False
@@ -341,12 +408,18 @@ class ReasoningXMLFilter:
                 hold = self._hold(buf, self._CLOSE_CAND)
                 self.pending = buf[len(buf) - hold:] if hold else ""
                 break
-            m = self.OPEN_RE.search(buf)
-            if m:  # 进入 XML 块
-                out.append(buf[:m.start()])
+            om = self.OPEN_RE.search(buf)
+            dm = _DSML_ANY_RE.search(buf)
+            if dm and (not om or dm.start() < om.start()):
+                # H41: 孤立 DSML 腐蚀标签＝上游噪声，剥离不外露
+                out.append(buf[:dm.start()])
+                buf = buf[dm.end():]
+                continue
+            if om:  # 进入 XML 块
+                out.append(buf[:om.start()])
                 self.suppress = True
-                self.tag = m.group(1).lower()
-                buf = buf[m.end():]
+                self.tag = om.group(1).lower()
+                buf = buf[om.end():]
                 continue
             # 跨分片审计：_hold 已保证仅当尾部是候选标签的合法前缀时才扣留；
             # 若后续分片使合并文本不再构成标签前缀（如 '<tool_'+'xyz'），
@@ -380,6 +453,7 @@ class ToolCallStreamParser:
         self.found = False
         self.events = []           # 全部事件（用于日志）
         self._after_block = False  # 刚输出完一个调用块，下一段正文需剥离开头围栏
+        self._corrupt = False      # H41: 流中出现过 DSML/</tocalls> 腐蚀（flush 容错提取依据）
 
     def _hold(self, buf, mode=None):
         """正文尾部疑似未完成的 '<tag...' 一律扣住，等下一个分片再判断。
@@ -388,9 +462,10 @@ class ToolCallStreamParser:
         if i != -1 and 0 < len(buf) - i <= 64 and ">" not in buf[i:]:
             tail = buf[i:]
             if mode == "inv":
-                # arguments 内：只扣留与已知标签前缀匹配的碎片
+                # arguments 内：只扣留与已知标签前缀匹配的碎片（含 H41 DSML 腐蚀变体）
                 candidates = ("<invoke", "</invoke", "<parameter", "</parameter",
-                              "<tool_calls", "</tool_calls", "<tool_call", "</tool_call")
+                              "<tool_calls", "</tool_calls", "<tool_call", "</tool_call",
+                              "<｜DSML｜", "</｜DSML｜")
                 if any(c.lower().startswith(tail.lower()) for c in candidates):
                     return len(buf) - i
                 return 0  # arguments 内的普通 '<' 不扣留，直接输出
@@ -437,9 +512,12 @@ class ToolCallStreamParser:
                 m_tc = _TC_OPEN_RE.search(self.buf)
                 m_tcc = _TCC_OPEN_RE.search(self.buf)
                 m_inv = _INVOKE_OPEN_RE.search(self.buf)
+                dm = _DSML_ANY_RE.search(self.buf)
                 idx = [m.start() for m in (m_tc, m_tcc, m_inv) if m]
                 if sc_pos is not None:
                     idx.append(sc_pos)
+                if dm:
+                    idx.append(dm.start())  # H41: 孤立 DSML 腐蚀标签剥离
                 if not idx:
                     hold = self._hold(self.buf, self.mode)
                     if hold:
@@ -458,6 +536,10 @@ class ToolCallStreamParser:
                 else:
                     tail = self.buf
                 # cut 处分类：包裹开标签 / 裸 invoke / 自闭合（均容忍额外属性与空白）
+                if dm and dm.start() == cut:
+                    self._corrupt = True
+                    self.buf = tail[dm.end() - cut:]  # H41: DSML 腐蚀标签＝上游噪声，剥离
+                    continue
                 if m_tc and m_tc.start() == cut:
                     self.mode, self.acc = "tc", ""
                     tail = tail[m_tc.end() - cut:]
@@ -474,9 +556,29 @@ class ToolCallStreamParser:
                 self.buf = tail
             else:
                 cm = _CLOSER_RES[self.mode].search(self.buf)
-                # H40 嵌套防误闭：候选闭合落在 <parameter> 值内时是字面文本，跳过找真闭合
-                while cm and _param_depth(self.acc + self.buf[:cm.start()]) > 0:
-                    cm = _CLOSER_RES[self.mode].search(self.buf, cm.end())
+                # H40 嵌套防误闭：候选闭合落在 <parameter> 值内时是字面文本，跳过找真闭合。
+                # H41 DSML 腐蚀闭合（｜DSML｜ 只可能是上游噪声，不可能是字面文本）按
+                # 「闭合最内层结构」消化：参数值内 → 改写 </parameter>；invoke 未闭合 →
+                # 改写 </invoke>；否则当作当前块闭合。
+                while cm:
+                    head = self.acc + self.buf[:cm.start()]
+                    if _DSML_CLOSE_RE.match(cm.group(0)):
+                        self._corrupt = True
+                        if _param_depth(head) > 0:
+                            self.acc += self.buf[:cm.start()] + "</parameter>"
+                            self.buf = self.buf[cm.end():]
+                            cm = _CLOSER_RES[self.mode].search(self.buf)
+                            continue
+                        if self.mode in ("tc", "single") and _unclosed_invoke(head):
+                            self.acc += self.buf[:cm.start()] + "</invoke>"
+                            self.buf = self.buf[cm.end():]
+                            cm = _CLOSER_RES[self.mode].search(self.buf)
+                            continue
+                        break
+                    if _param_depth(head) > 0:
+                        cm = _CLOSER_RES[self.mode].search(self.buf, cm.end())
+                        continue
+                    break
                 if not cm:
                     # closer 可能被分片拆在 acc/buf 边界（如 '...</tool_call' + 's>'）：
                     # 扣住尾部窗口（最长 closer 长度-1）并入下次匹配，其余先入 acc
@@ -494,7 +596,7 @@ class ToolCallStreamParser:
         return "".join(out_c), out_t
 
     def flush(self):
-        """流结束: 残余完整自闭合调用转为事件；未闭合块按原文吐出（防丢失）
+        """流结束: 残余完整自闭合调用转为事件；未闭合块容错提取，失败才按原文吐出
         返回 (残余正文, [tool_calls事件])"""
         left, evs = "", []
         if self.mode in ("tc", "single"):
@@ -502,6 +604,19 @@ class ToolCallStreamParser:
             left = opener + self.acc + self.buf
         elif self.mode == "inv":
             left = self.acc + self.buf
+        if self.mode is not None:
+            # H41 容错提取：存在 DSML 腐蚀/</tocalls> 痕迹的未闭合块优先解析成
+            # tool_calls 事件，避免 <> 原文外露；无腐蚀痕迹保持旧约定按原文吐出
+            # （防截断丢失，供上游续传调试）
+            if _DSML_ANY_RE.search(left) or re.search(r'</tocalls', left, re.I) or self._corrupt:
+                # extract_tool_calls 返回 OpenAI 格式，转回 _evt 所需裸格式
+                clean, tcs = extract_tool_calls(left, self.known)
+                if tcs:
+                    for tc in tcs:
+                        fn = tc["function"]
+                        evs.append(self._evt({"name": fn["name"], "arguments": fn["arguments"]}))
+                    left = clean
+                    self._after_block = True
         else:
             left = self.buf
             sc = self._match_selfclosing(left)
@@ -511,6 +626,7 @@ class ToolCallStreamParser:
                 left = left[m.end():]
                 if self._after_block:
                     left = _FENCE_HEAD_RE.sub('', left, count=1)
+            left = _DSML_ANY_RE.sub("", left)  # H41: 残余腐蚀标签剥离
         self.buf = self.acc = ""
         self.mode = None
         return left, evs
@@ -522,6 +638,29 @@ def check_auth(request: Request):
     token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
     if not token or not verify_key(token):
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+# ---------- 在线重启 ----------
+
+RESTART_CALLBACK = None  # 宿主（托盘/TUI）注册的重启实现；None 时走进程自我替换兜底
+
+
+def request_restart() -> bool:
+    """请求重启服务（加载最新代码/配置）。返回是否已受理（有宿主回调）。"""
+    if callable(RESTART_CALLBACK):
+        def worker():
+            try:
+                RESTART_CALLBACK()
+            except Exception:
+                log_error("在线重启失败:\n" + traceback.format_exc())
+        threading.Thread(target=worker, daemon=True, name="restart").start()
+        return True
+    return False
+
+
+def _self_exec():
+    """进程自我替换（裸跑 python chat2api.py 时用；托盘/TUI 托管时由宿主回调处理）"""
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 app = FastAPI(title="USTB DeepSeek chat2api")
@@ -757,6 +896,8 @@ async def chat_completions(request: Request):
         text, calls = extract_tool_calls(content, known_tools)
         if calls:
             log_tools(calls)
+        angle_bracket_check(text, "content", {})      # 尖括号预警（调试阶段）
+        angle_bracket_check(reasoning, "reasoning", {})
         pt = usage.get("prompt_tokens") if usage else None
         ct = usage.get("completion_tokens") if usage else None
         if ct is None:
@@ -774,6 +915,7 @@ async def chat_completions(request: Request):
         out_chars = 0        # 输出字符数（usage 缺失时估算用）
         usage_pt = usage_ct = None
         status = 200
+        warn_c, warn_r = {}, {}  # 尖括号预警累计状态（content / reasoning 各一）
         # 首块: role
         yield make_chunk(cid, model, {"role": "assistant", "content": ""})
         held_finish = None
@@ -793,11 +935,13 @@ async def chat_completions(request: Request):
                     if reasoning:
                         r_txt = rfilter.feed(reasoning)
                         if r_txt:
+                            angle_bracket_check(r_txt, "reasoning", warn_r)
                             yield make_chunk(cid, model, {"reasoning_content": r_txt})
                     if text:
                         out_chars += len(text)
                         out_c, out_t = parser.feed(text)
                         if out_c:
+                            angle_bracket_check(out_c, "content", warn_c)
                             yield make_chunk(cid, model, {"content": out_c})
                         for ev in out_t:
                             yield make_chunk(cid, model, {"tool_calls": [ev]})
@@ -805,12 +949,14 @@ async def chat_completions(request: Request):
                         held_finish = finish  # 最后再发，保证 flush 事件先于结束帧
             r_rest = rfilter.flush()
             if r_rest:
+                angle_bracket_check(r_rest, "reasoning", warn_r)
                 yield make_chunk(cid, model, {"reasoning_content": r_rest})
             left, left_ev = parser.flush()
             for ev in left_ev:
                 yield make_chunk(cid, model, {"tool_calls": [ev]})
             if left:
                 out_chars += len(left)
+                angle_bracket_check(left, "content", warn_c)
                 yield make_chunk(cid, model, {"content": left})
             if held_finish or parser.found:
                 yield make_chunk(cid, model, {},
@@ -845,6 +991,17 @@ async def models(request: Request):
         "data": [{"id": mid, "object": "model", "owned_by": "ustb-chat2api"}
                  for mid in MODEL_ALIASES],
     }
+
+
+@app.post("/restart")
+async def restart(request: Request):
+    """在线重启服务（修改代码/排查问题后免手动杀进程）。需 API Key 鉴权。"""
+    check_auth(request)
+    if request_restart():
+        return JSONResponse({"ok": True, "detail": "重启已受理，服务约 2~5 秒后恢复"})
+    # 无宿主托管（裸跑 python chat2api.py）：先应答，再自我替换进程加载最新代码
+    threading.Timer(0.5, _self_exec).start()
+    return JSONResponse({"ok": True, "detail": "服务将以新进程重启"})
 
 
 if __name__ == "__main__":

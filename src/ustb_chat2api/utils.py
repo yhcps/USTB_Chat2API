@@ -21,6 +21,7 @@ LOG_DIR = os.path.join(BASE_DIR, "logs")
 ERROR_LOG = os.path.join(LOG_DIR, "server_error.log")
 DEBUG_LOG = os.path.join(LOG_DIR, "server_debug.log")
 TRAY_LOG = os.path.join(LOG_DIR, "tray.log")
+WARN_LOG = os.path.join(LOG_DIR, "server_warn.log")
 
 # 确保目录存在
 for d in [CONFIG_DIR, LOG_DIR]:
@@ -54,6 +55,40 @@ def log_tools(calls: list):
                     f"{[(c['function']['name'], c['function']['arguments'][:80]) for c in calls]}\n")
     except Exception:
         pass
+
+
+def log_warn(msg: str):
+    """尖括号预警落盘（调试阶段专用，独立于 server_error.log）"""
+    try:
+        with open(WARN_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%m-%d %H:%M:%S}] {msg}\n")
+    except Exception:
+        pass
+
+
+# 尖括号预警判据（调试阶段）：命中已知泄露模式立即告警；否则按密度/总量阈值
+_LEAK_PAT_RE = re.compile(r'</?\s*(?:tool_calls?|invoke|parameter|tocalls)\b|｜DSML｜', re.I)
+_ANGLE_DENSITY = 0.08    # 尖括号占字符比阈值（正常代码/正文远低于此）
+_ANGLE_MIN_CHARS = 200   # 参与密度判定的样本下限
+_ANGLE_MAX_CNT = 200     # 单次响应累计尖括号数硬阈值
+
+
+def angle_bracket_check(text: str, channel: str, state: dict):
+    """下发给客户端的正文/思考流尖括号预警（调试阶段）。
+    大量尖括号或已知泄露模式（<tool_calls/</invoke/｜DSML｜ 等）自动写 server_warn.log。
+    state: 每次响应每通道一个 dict（累计计数）；每通道每次响应最多告警 1 次防刷屏。"""
+    if not text:
+        return
+    state["cnt"] = state.get("cnt", 0) + text.count("<") + text.count(">")
+    state["chars"] = state.get("chars", 0) + len(text)
+    m = _LEAK_PAT_RE.search(text)
+    dense = (state["chars"] >= _ANGLE_MIN_CHARS
+             and state["cnt"] / state["chars"] > _ANGLE_DENSITY)
+    if (m or dense or state["cnt"] >= _ANGLE_MAX_CNT) and not state.get("warned"):
+        state["warned"] = True
+        sample = text[:120].replace("\n", "\\n")
+        log_warn(f"尖括号预警 channel={channel} cnt={state['cnt']} chars={state['chars']} "
+                 f"pattern={m.group(0) if m else '-'} sample={sample}")
 
 
 # ===== 配置管理 =====

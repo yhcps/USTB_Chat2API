@@ -11,6 +11,7 @@ USTB Chat2API 命令行工具箱（合并原 update_cookies.py 与 manage_keys.p
   key generate [名称]                       # 生成新 API Key（明文仅显示一次，落盘为哈希）
   key list                                  # 列出所有 Key（只显示前缀）
   key revoke <前缀>                         # 按 Key 前缀吊销
+  restart                                   # 在线重启服务（服务离线时自动拉起托盘启动）
 
 说明:
 - Cookie/Key 均热加载，增改后无需重启服务
@@ -28,7 +29,7 @@ import time
 
 import requests
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 sys.path.insert(0, BASE_DIR)
 
 from chat2api import load_config, CONFIG_FILE, PORT  # noqa: E402
@@ -237,6 +238,33 @@ def key_revoke(prefix: str):
         print(f"[OK] 已吊销 {k['key_prefix']} (名称: {k['name']})")
 
 
+# ==================== 服务重启部分 ====================
+
+def service_restart() -> int:
+    """在线重启服务（POST /restart，加载最新代码/配置）；服务离线时拉起托盘兜底"""
+    cfg = load_config()
+    try:
+        r = requests.post(f"http://127.0.0.1:{PORT}/restart", timeout=10,
+                          headers={"Authorization": f"Bearer {cfg['api_key']}"})
+        if r.status_code == 200:
+            detail = r.json().get("detail", "")
+            print(f"[OK] {detail or '重启已受理'}（http://127.0.0.1:{PORT}/v1）")
+            return 0
+        print(f"[错误] 重启失败: HTTP {r.status_code} {r.text[:120]}")
+        return 1
+    except requests.RequestException:
+        print(f"[提示] 服务未运行，拉起托盘以启动服务...")
+        if getattr(sys, "frozen", False):
+            subprocess.Popen([sys.executable], cwd=BASE_DIR)
+        elif os.name == "nt":
+            pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+            subprocess.Popen([pythonw, os.path.join(BASE_DIR, "tray.py")], cwd=BASE_DIR)
+        else:
+            subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "tray.py")], cwd=BASE_DIR)
+        print("[OK] 托盘已拉起，服务将由其自动启动")
+        return 0
+
+
 # ==================== 入口 ====================
 
 def main(argv: list) -> int:
@@ -268,6 +296,8 @@ def main(argv: list) -> int:
         else:
             print(__doc__)
             return 1
+    elif cmd == "restart":
+        return service_restart()
     else:
         print(__doc__)
         return 1

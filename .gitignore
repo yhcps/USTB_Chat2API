@@ -32,3 +32,8 @@ build/
 # ===== IDE =====
 .idea/
 .vscode/
+
+# ===== 临时产物（会话导出 / 运行时统计，勿上传） =====
+stats.json
+temp/
+完善项目 README 文档说明.md

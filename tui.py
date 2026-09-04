@@ -9,6 +9,7 @@ USTB chat2api TUI 控制台
   [5] 重新生成 API Key（立即生效，无需重启）
   [6] 重新检测服务与密钥
   [7] 发送测试对话
+  [9] 重启服务（整进程替换，加载最新代码，调试改完代码后用）
   [0] 检测登录状态
   [h] 隐藏到托盘（服务转交托盘常驻，窗口关闭）
   [q] 退出（停止服务）
@@ -16,8 +17,8 @@ USTB chat2api TUI 控制台
 运行: python tui.py
 """
 import json
-import msvcrt
 import os
+import platform
 import secrets
 import string
 import subprocess
@@ -27,7 +28,9 @@ import time
 
 import requests
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+IS_WINDOWS = platform.system() == "Windows"
+
+BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 sys.path.insert(0, BASE_DIR)
 
 import chat2api
@@ -81,6 +84,21 @@ def start_server():
     threading.Thread(target=run, daemon=True, name="uvicorn").start()
 
 
+def _exec_self_tui():
+    """TUI 整进程自我替换：同进程重启 uvicorn 不会重载 chat2api 模块，必须换新进程"""
+    if getattr(sys, "frozen", False):
+        os.execv(sys.executable, [sys.executable, "tui"])
+    else:
+        python_exe = sys.executable.replace("pythonw.exe", "python.exe")
+        os.execv(python_exe, [python_exe, os.path.join(BASE_DIR, "tui.py")])
+
+
+def _api_restart_callback():
+    """供 /restart 端点调用：先让 HTTP 应答送达，再整进程重启"""
+    time.sleep(0.5)
+    _exec_self_tui()
+
+
 def validate_service():
     """验证服务连通性 + Key 有效性，结果写入 STATE，附排查建议"""
     cfg = load_config()
@@ -126,6 +144,26 @@ def check_session(quiet=True):
     return "valid" if verify_cookies(ck, quiet=quiet) else "expired"
 
 
+def _kbhit(sec=0.1):
+    """跨平台按键检测：返回 True 表示有按键被按下"""
+    if IS_WINDOWS:
+        import msvcrt
+        return msvcrt.kbhit()
+    else:
+        import select
+        return select.select([sys.stdin], [], [], sec) == ([sys.stdin], [], [])
+
+
+def _getch():
+    """跨平台读取单键"""
+    if IS_WINDOWS:
+        import msvcrt
+        return msvcrt.getch()
+    else:
+        ch = sys.stdin.read(1)
+        return ch.encode() if ch else b""
+
+
 def login_flow():
     """未登录: 拉起浏览器到登录页，轮询截取登录后的身份信息；按任意键取消"""
     STATE["msg"] = "正在启动浏览器并等待登录（登录完成后自动截取，按任意键取消）..."
@@ -144,8 +182,8 @@ def login_flow():
             STATE["msg"] = ("Cookie 已截取并保存 ✓ 会话有效"
                             if ok else "Cookie 已保存，但会话验证未通过，可能需要重新登录 SSO")
             return
-        if msvcrt.kbhit():
-            msvcrt.getch()
+        if _kbhit():
+            _getch()
             STATE["msg"] = "已取消登录流程"
             return
         time.sleep(1.5)
@@ -156,8 +194,23 @@ def login_flow():
 
 def copy_to_clipboard(text) -> bool:
     try:
-        p = subprocess.Popen(["clip"], stdin=subprocess.PIPE, shell=True)
-        p.communicate(text.encode("gbk", "replace"))
+        if IS_WINDOWS:
+            p = subprocess.Popen(["clip"], stdin=subprocess.PIPE, shell=True)
+            p.communicate(text.encode("gbk", "replace"))
+        elif sys.platform == "darwin":
+            p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+            p.communicate(text.encode("utf-8"))
+        else:  # Linux X11/Wayland
+            for cmd in (["xclip", "-selection", "clipboard"], ["wl-copy"]):
+                try:
+                    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                    p.communicate(text.encode("utf-8"))
+                    if p.returncode == 0:
+                        break
+                except FileNotFoundError:
+                    continue
+            else:
+                return False
         return True
     except Exception:
         return False
@@ -198,7 +251,7 @@ SESSION_TEXT = {"valid": "已登录（会话有效）", "expired": "会话已失
 
 
 def render(cfg):
-    os.system("cls")
+    _clear_screen()
     key = cfg["api_key"]
     s_detail = STATE["service_detail"]
     print(f"{BOLD}┌─ USTB chat2api 控制台 ──────────────────────────────────────┐{RESET}")
@@ -214,7 +267,7 @@ def render(cfg):
     print(f"│  {BOLD}[1]{RESET} 复制端点   {BOLD}[2]{RESET} 复制 Base URL   {BOLD}[3]{RESET} 复制 API Key")
     print(f"│  {BOLD}[4]{RESET} 登录/更新 Cookie   {BOLD}[5]{RESET} 重新生成 Key")
     print(f"│  {BOLD}[6]{RESET} 重新检测服务   {BOLD}[7]{RESET} 测试对话   {BOLD}[8]{RESET} 打开 Dashboard")
-    print(f"│  {BOLD}[0]{RESET} 检测登录状态   {BOLD}[h]{RESET} 隐藏到托盘   {BOLD}[q]{RESET} 退出")
+    print(f"│  {BOLD}[9]{RESET} 重启服务   {BOLD}[0]{RESET} 检测登录状态   {BOLD}[h]{RESET} 隐藏到托盘   {BOLD}[q]{RESET} 退出")
     print(f"└─────────────────────────────────────────────────────────────┘")
     if STATE["msg"]:
         color = GREEN if "✓" in STATE["msg"] else (RED if ("失败" in STATE["msg"] or "无效" in STATE["msg"]) else YELLOW)
@@ -253,14 +306,24 @@ def handle_key(k, cfg):
             import webbrowser
             webbrowser.open(f"http://127.0.0.1:{PORT}/dashboard")
             STATE["msg"] = "已在浏览器中打开 Dashboard"
+    elif k == b"9":
+        STATE["msg"] = "正在重启服务（整进程替换，加载最新代码）..."
+        render(load_config())
+        _exec_self_tui()
     elif k == b"0":
         STATE["session"] = check_session()
         STATE["msg"] = f"登录状态: {SESSION_TEXT.get(STATE['session'], '未知')}"
 
 
+def _clear_screen():
+    """跨平台清屏"""
+    os.system("cls" if IS_WINDOWS else "clear")
+
+
 def main():
     os.system("")  # 启用 Windows 终端 ANSI 转义
     cfg = ensure_default_key()
+    chat2api.RESTART_CALLBACK = _api_restart_callback  # /restart 端点 -> 整进程重启
 
     # 启动服务: 端口空闲则内嵌启动，否则复用已有实例
     if service_online():
@@ -280,16 +343,21 @@ def main():
     while True:
         cfg = load_config()
         render(cfg)
-        k = msvcrt.getch()
+        k = _getch()
         if k in (b"q", b"Q", b"\x03"):
-            os.system("cls")
+            _clear_screen()
             print("chat2api 已退出（服务已停止）")
             return
         if k in (b"h", b"H"):
             # 隐藏 TUI: 转交托盘常驻（托盘会在服务掉线时自动拉起）
-            pythonw = sys.executable.replace("python.exe", "pythonw.exe")
-            subprocess.Popen([pythonw, os.path.join(BASE_DIR, "tray.py")], cwd=BASE_DIR)
-            os.system("cls")
+            if getattr(sys, "frozen", False):  # 单 EXE: 无参数启动即托盘
+                subprocess.Popen([sys.executable], cwd=BASE_DIR)
+            elif IS_WINDOWS:
+                pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+                subprocess.Popen([pythonw, os.path.join(BASE_DIR, "tray.py")], cwd=BASE_DIR)
+            else:
+                subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "tray.py")], cwd=BASE_DIR)
+            _clear_screen()
             print("TUI 已隐藏，服务转由系统托盘常驻管理（任务栏右下角图标，左键点击图标可重新打开本控制台）。")
             time.sleep(1)
             return

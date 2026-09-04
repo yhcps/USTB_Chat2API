@@ -10,6 +10,7 @@ usage 缺失时 tokens 按字符数估算（约 2.5 字符/token，中英混合�
 """
 import json
 import os
+import sys
 import threading
 import time
 import atexit
@@ -23,7 +24,7 @@ router = APIRouter()
 MAX_CONTEXT_TOKENS = 65536  # 展示用参考上限（上游真实上限用 tests/test_context_length.py 探测）
 
 _LOCK = threading.Lock()
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 _STATS_FILE = os.path.join(_BASE_DIR, "stats.json")
 
 
@@ -176,7 +177,8 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <h1>USTB Chat2API Dashboard <span id="dot" class="warn">●</span>
-  <span id="sess" style="font-size:12px;color:#9ca3af"></span></h1>
+  <span id="sess" style="font-size:12px;color:#9ca3af"></span>
+  <button onclick="doRestart()" style="float:right;background:#374151;color:#e5e7eb;border:0;border-radius:6px;padding:6px 14px;cursor:pointer;font-size:12px">重启服务</button></h1>
 <div class="grid">
   <div class="card"><div class="k">吐词速度（最近请求）</div><div class="v"><span id="tps">--</span> tok/s</div></div>
   <div class="card"><div class="k">最近上下文用量</div><div class="v"><span id="ctx">--</span> tok</div></div>
@@ -205,6 +207,15 @@ function draw(series){
     py=c.height-20-(p[1]/mx)*H;i?x.lineTo(px,py):x.moveTo(px,py)});
   x.stroke();
   x.fillStyle="#6b7280";x.fillText(mx.toFixed(1)+" tok/s",10,c.height-4);
+}
+async function doRestart(){
+  const key=prompt("请输入 API Key 以重启服务：");
+  if(!key)return;
+  try{
+    const r=await fetch("/restart",{method:"POST",headers:{Authorization:"Bearer "+key}});
+    const d=await r.json().catch(()=>({}));
+    alert(r.ok?(d.detail||"重启已受理"):"重启失败: HTTP "+r.status+" "+(d.detail||""));
+  }catch(e){alert("请求失败: "+e)}
 }
 async function tick(){
   try{
