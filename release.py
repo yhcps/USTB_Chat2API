@@ -4,8 +4,11 @@ USTB Chat2API 统一构建脚本
 
 用法:
     python release.py              # 打包为 release zip
-    python release.py --exe        # 打包为单文件 EXE（需 PyInstaller）
+    python release.py --exe        # 打包为 Windows 单文件 EXE（需 PyInstaller）
     python release.py --exe --no-clean   # 跳过清理直接打包
+
+Linux DEB 请在 WSL / Linux 中执行:
+    python3 release-linux.py       # 构建 Linux DEB（单文件二进制 + systemd 服务单元）
 
 构建产物输出到 dist/ 目录。
 """
