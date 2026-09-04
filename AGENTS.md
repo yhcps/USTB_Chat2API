@@ -10,14 +10,21 @@ TODO.md是待办列表，项目中会涉及多个Agent的交互，即使写入�
 ## 架构与文件
 | 文件 | 职责 |
 |---|---|
-| `chat2api.py` | 核心：FastAPI 转发 + `ToolCallStreamParser`（XML→tool_calls）+ `ReasoningXMLFilter`（思考区 XML 剥离）+ 消息归一 |
+| `kernel.py` | **内核**：解析器（`ToolCallStreamParser`/`ReasoningXMLFilter`）+ 工具桥 prompt + 尖括号预警。纯逻辑，支持进程内热重载（`importlib.reload`） |
+| `chat2api.py` | **外壳**：FastAPI 路由/鉴权/转发 + in-flight 跟踪 + `/reload` `/restart` 端点 + 间隙 watcher |
 | `tray.py` | 系统托盘：uvicorn 内线程，服务掉线自动拉起，单实例 mutex |
 | `tui.py` | TUI 控制台，`[h]` 可转交托盘 |
-| `cli.py` | 命令行：`python cli.py cookie` / `key generate|list|revoke` / `restart`（热重载） |
-| `dashboard.py` | `/dashboard` 可视化 + `/stats` JSON |
-| `entry.py` | 单 EXE 入口：`sys._MEIPASS` 路径适配 + argv 分发 tray/tui/cli |
-| `release.py` | 统一构建：默认 release zip；`--exe` 走 PyInstaller 单文件 |
+| `cli.py` | 命令行：`cookie` / `key generate|list|revoke` / `restart`（整进程）/ `reload`（内核热重载） |
+| `dashboard.py` | `/dashboard` 可视化（含热重载/重启按钮）+ `/stats`（含 inflight） |
+| `entry.py` | 单 EXE/DEB 统一入口：平台自适应（Win=托盘, Linux=serve）+ argv 分发 |
+| `release.py` / `release-linux.py` | Windows EXE / Linux DEB 构建 |
 | `config.json` | 运行时生成，存 cookies + api_key（勿提交） |
+
+## 内核/外壳分离（热更新架构）
+- 内核与外壳分文件；**外壳调用内核符号必须写 `kernel.X` 动态引用**，严禁 from-import 后直接调用（那样热重载不生效，reload 后仍跑旧绑定）。
+- `/reload`：进程内热重载内核，毫秒级、不断连接；进行中的响应用旧实例不受影响。
+- `/restart`：整进程替换（外壳级变更）。两者均**对话间隙感知**：in-flight>0 时挂起，最后一个响应体块发完归零后由 watcher 自动执行。
+- in-flight 由 `InFlightMiddleware`（纯 ASGI，按最后一个 body 块递减）精确统计，`/stats` 暴露 `inflight`。
 
 ## 常用命令
 ```powershell
@@ -92,7 +99,7 @@ TODO.md是待办列表，项目中会涉及多个Agent的交互，即使写入�
 ## 双写同步（当前架构事实）
 
 refactor 分支引入 `src/ustb_chat2api/` 包版，但**生产仍跑根目录扁平 `chat2api.py`**（tray/tui/cli 导入扁平版，config.json 在根目录）。过渡期约束：
-- 解析/服务端修复**必须同时改两份**：`chat2api.py`（生产）与 `src/ustb_chat2api/server.py`（包）。
+- 解析/服务端修复**必须同时改两份**：扁平 `kernel.py` + `chat2api.py` 与包版 `src/ustb_chat2api/kernel.py` + `server.py`（包版 content_to_text/angle_bracket_check 在 utils.py，不随 kernel 热重载）。
 - 测试两版都要过：`python tests/test_tools_unit.py`（包版）+ `python tests/test_tools_unit.py --flat`（扁平版）。
 - 包版 `config/`、`logs/` 目录从未启用，勿按包版路径排查线上问题。
 

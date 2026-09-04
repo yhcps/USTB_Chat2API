@@ -104,6 +104,11 @@ async def stats():
             "tps_series": list(_STATS["tps_series"]),
         }
     d["session"] = _get_session()
+    try:
+        from .server import get_inflight  # 延迟导入避免循环
+        d["inflight"] = get_inflight()
+    except Exception:
+        d["inflight"] = None
     d["max_context_tokens_ref"] = MAX_CONTEXT_TOKENS
     return d
 
@@ -130,13 +135,16 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <h1>USTB Chat2API Dashboard <span id="dot" class="warn">●</span>
-  <span id="sess" style="font-size:12px;color:#9ca3af"></span></h1>
+  <span id="sess" style="font-size:12px;color:#9ca3af"></span>
+  <button onclick="doReload()" style="float:right;background:#1e3a5f;color:#93c5fd;border:0;border-radius:6px;padding:6px 14px;cursor:pointer;font-size:12px;margin-right:8px">热重载内核</button>
+  <button onclick="doRestart()" style="float:right;background:#374151;color:#e5e7eb;border:0;border-radius:6px;padding:6px 14px;cursor:pointer;font-size:12px">重启服务</button></h1>
 <div class="grid">
   <div class="card"><div class="k">吐词速度（最近请求）</div><div class="v"><span id="tps">--</span> tok/s</div></div>
   <div class="card"><div class="k">最近上下文用量</div><div class="v"><span id="ctx">--</span> tok</div></div>
   <div class="card"><div class="k">累计 tokens (入/出)</div><div class="v" style="font-size:18px"><span id="tot">--</span></div></div>
   <div class="card"><div class="k">累计 token (总)</div><div class="v" style="font-size:18px"><span id="totctx">--</span></div></div>
   <div class="card"><div class="k">请求总数 / 错误</div><div class="v" style="font-size:18px"><span id="req">--</span></div></div>
+  <div class="card"><div class="k">活跃对话（进行中）</div><div class="v" style="font-size:18px"><span id="inflight">--</span></div></div>
   <div class="card"><div class="k">服务运行时长</div><div class="v" style="font-size:18px"><span id="up">--</span></div></div>
 </div>
 <canvas id="chart" width="960" height="140"></canvas>
@@ -160,6 +168,24 @@ function draw(series){
   x.stroke();
   x.fillStyle="#6b7280";x.fillText(mx.toFixed(1)+" tok/s",10,c.height-4);
 }
+async function doReload(){
+  const key=prompt("请输入 API Key 以热重载内核：");
+  if(!key)return;
+  try{
+    const r=await fetch("/reload",{method:"POST",headers:{Authorization:"Bearer "+key}});
+    const d=await r.json().catch(()=>({}));
+    alert((d.detail)||(r.ok?"热重载已受理":"失败 HTTP "+r.status));
+  }catch(e){alert("请求失败: "+e)}
+}
+async function doRestart(){
+  const key=prompt("请输入 API Key 以重启服务：");
+  if(!key)return;
+  try{
+    const r=await fetch("/restart",{method:"POST",headers:{Authorization:"Bearer "+key}});
+    const d=await r.json().catch(()=>({}));
+    alert(r.ok?(d.detail||"重启已受理"):"重启失败: HTTP "+r.status+" "+(d.detail||""));
+  }catch(e){alert("请求失败: "+e)}
+}
 async function tick(){
   try{
     const s=await (await fetch("/stats")).json();
@@ -174,6 +200,7 @@ async function tick(){
     $("tot").textContent=fmtTok(s.total_prompt_tokens)+" / "+fmtTok(s.total_completion_tokens);
     $("totctx").textContent=fmtTok(s.total_context_tokens);
     $("req").textContent=s.total_requests+" / "+s.total_errors;
+    $("inflight").textContent=(s.inflight!=null?s.inflight:"--");
     $("up").textContent=fmtT(s.uptime_s);
     draw(s.tps_series);
     $("rows").innerHTML=[...s.recent].reverse().slice(0,12).map(r=>

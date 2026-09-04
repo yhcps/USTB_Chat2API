@@ -11,7 +11,8 @@ USTB Chat2API 命令行工具箱（合并原 update_cookies.py 与 manage_keys.p
   key generate [名称]                       # 生成新 API Key（明文仅显示一次，落盘为哈希）
   key list                                  # 列出所有 Key（只显示前缀）
   key revoke <前缀>                         # 按 Key 前缀吊销
-  restart                                   # 在线重启服务（服务离线时自动拉起托盘启动）
+  restart                                   # 整进程重启（对话间隙自动执行；离线时拉起托盘）
+  reload                                    # 内核热重载（解析器/工具桥，对话间隙毫秒级生效，不断连接）
 
 说明:
 - Cookie/Key 均热加载，增改后无需重启服务
@@ -239,21 +240,35 @@ def key_revoke(prefix: str):
         print(f"[OK] 已吊销 {k['key_prefix']} (名称: {k['name']})")
 
 
-# ==================== 服务重启部分 ====================
+# ==================== 服务重启/热更新部分 ====================
 
-def service_restart() -> int:
-    """在线重启服务（POST /restart，加载最新代码/配置）；服务离线时拉起托盘兜底"""
+def _post_action(path: str, action: str):
+    """向本地服务发送 POST 管理动作，返回 (ok, detail)"""
     cfg = load_config()
     try:
-        r = requests.post(f"http://127.0.0.1:{PORT}/restart", timeout=10,
+        r = requests.post(f"http://127.0.0.1:{PORT}{path}", timeout=10,
                           headers={"Authorization": f"Bearer {cfg['api_key']}"})
         if r.status_code == 200:
-            detail = r.json().get("detail", "")
-            print(f"[OK] {detail or '重启已受理'}（http://127.0.0.1:{PORT}/v1）")
-            return 0
-        print(f"[错误] 重启失败: HTTP {r.status_code} {r.text[:120]}")
-        return 1
-    except requests.RequestException:
+            return True, r.json().get("detail", "")
+        return False, f"HTTP {r.status_code} {r.text[:120]}"
+    except requests.RequestException as e:
+        return False, f"{e.__class__.__name__}: 服务未运行? 端口 {PORT}"
+
+
+def service_reload() -> int:
+    """对话间隙热重载内核（kernel.py 解析器/工具桥），不断连接、不换进程"""
+    ok, detail = _post_action("/reload", "reload")
+    print(f"[{'OK' if ok else '错误'}] {detail}")
+    return 0 if ok else 1
+
+
+def service_restart() -> int:
+    """整进程重启（对话间隙感知）；服务离线时拉起托盘兜底"""
+    ok, detail = _post_action("/restart", "restart")
+    if ok:
+        print(f"[OK] {detail}（http://127.0.0.1:{PORT}/v1）")
+        return 0
+    if "服务未运行" in detail or "ConnectionError" in detail or "NameResolver" in detail:
         print(f"[提示] 服务未运行，拉起托盘以启动服务...")
         if getattr(sys, "frozen", False):
             subprocess.Popen([sys.executable], cwd=BASE_DIR)
@@ -264,6 +279,8 @@ def service_restart() -> int:
             subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "tray.py")], cwd=BASE_DIR)
         print("[OK] 托盘已拉起，服务将由其自动启动")
         return 0
+    print(f"[错误] 重启失败: {detail}")
+    return 1
 
 
 # ==================== 入口 ====================
@@ -299,6 +316,8 @@ def main(argv: list) -> int:
             return 1
     elif cmd == "restart":
         return service_restart()
+    elif cmd == "reload":
+        return service_reload()
     else:
         print(__doc__)
         return 1
