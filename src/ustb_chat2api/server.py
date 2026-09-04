@@ -1004,9 +1004,14 @@ async def restart(request: Request):
     return JSONResponse({"ok": True, "detail": "服务将以新进程重启"})
 
 
-if __name__ == "__main__":
+def serve():
+    """headless 服务启动入口（Linux/服务器部署默认入口，供 entry.py 调用）"""
     import uvicorn
     cfg = load_config()
     print(f"chat2api 启动: http://{get_host()}:{PORT}/v1")
-    print(f"API Key: {cfg['api_key']}  |  Cookies: {'已配置' if cfg['cookies'].get('easy_session') else '未配置，请运行 python update_cookies.py'}")
+    print(f"API Key: {cfg['api_key']}  |  Cookies: {'已配置' if cfg['cookies'].get('easy_session') else '未配置，请运行 ustb-chat2api cli cookie'}")
     uvicorn.run(app, host=get_host(), port=PORT, log_level="warning")
+
+
+if __name__ == "__main__":
+    serve()

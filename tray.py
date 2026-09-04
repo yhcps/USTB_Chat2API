@@ -27,7 +27,7 @@ from PIL import Image, ImageDraw, ImageFont
 import pystray
 
 IS_WINDOWS = platform.system() == "Windows"
-BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+BASE_DIR = os.environ.get("CHAT2API_HOME") or os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 sys.path.insert(0, BASE_DIR)
 
 LOG_FILE = os.path.join(BASE_DIR, "tray.log")

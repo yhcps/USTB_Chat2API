@@ -29,7 +29,7 @@ import time
 
 import requests
 
-BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+BASE_DIR = os.environ.get("CHAT2API_HOME") or os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 sys.path.insert(0, BASE_DIR)
 
 from chat2api import load_config, CONFIG_FILE, PORT  # noqa: E402
@@ -211,7 +211,8 @@ def key_generate(name: str):
 def key_list():
     keys = _load_keys()
     if not keys:
-        print("暂无 key，先运行: python cli.py key generate [名称]")
+        cmd = "ustb-chat2api cli" if getattr(sys, "frozen", False) else "python cli.py"
+        print(f"暂无 key，先运行: {cmd} key generate [名称]")
         return
     print(f"共 {len(keys)} 个 key:")
     for i, k in enumerate(keys, 1):

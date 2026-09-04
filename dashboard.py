@@ -24,7 +24,7 @@ router = APIRouter()
 MAX_CONTEXT_TOKENS = 65536  # 展示用参考上限（上游真实上限用 tests/test_context_length.py 探测）
 
 _LOCK = threading.Lock()
-_BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+_BASE_DIR = os.environ.get("CHAT2API_HOME") or os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 _STATS_FILE = os.path.join(_BASE_DIR, "stats.json")
 
 
